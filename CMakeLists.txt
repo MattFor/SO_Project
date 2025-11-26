@@ -1,12 +1,20 @@
 cmake_minimum_required(VERSION 4.0)
-project(SO_Project)
+project(SO_Project LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 26)
 
-# katalog z plikami nagłówkowymi
+# headers
 include_directories(include)
 
 add_executable(SO_Project
         main.cpp
         src/Logger.cpp
+        src/LoggerService.cpp
+        include/LoggerService.h
 )
+
+# windows networking support
+if (WIN32)
+    target_compile_definitions(SO_Project PRIVATE WIN32_LEAN_AND_MEAN)
+    target_link_libraries(SO_Project PRIVATE ws2_32)
+endif()
