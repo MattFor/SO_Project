@@ -1,4 +1,4 @@
-# Topic 8 — Emergency Department (ED)
+# Topic — Emergency Department (ED)
 
 **Emergency Department (ED)** operates 24 hours a day, providing immediate help to people in life- or health-threatening conditions. The ED’s operation is based on **triage**, i.e. assessing patients’ condition to determine priority of care (this does **not** follow arrival order). The waiting room has **N** places.
 
