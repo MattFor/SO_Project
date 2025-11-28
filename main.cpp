@@ -8,7 +8,7 @@
 #include <iostream>
 #include <filesystem>
 
-#include "include/LoggerService.h"
+#include "include/logger/LoggerService.h"
 
 
 // Global flag set from signal/console handlers
@@ -32,7 +32,7 @@ BOOL WINAPI console_ctrl_handler(DWORD ctrl_type)
         case CTRL_SHUTDOWN_EVENT:
         case CTRL_LOGOFF_EVENT:
             request_terminate();
-            // return TRUE to indicate we handled it (prevents default)
+            // Return TRUE to indicate we handled it (prevents default)
             return TRUE;
         default:
             return FALSE;

@@ -12,6 +12,7 @@
 #include <format>
 #include <fstream>
 #include <filesystem>
+#include <utility>
 
 class Logger
 {
@@ -30,7 +31,7 @@ class Logger
 
 
 public:
-    explicit Logger(const std::filesystem::path& p) : path(p)
+    explicit Logger(std::filesystem::path  p) : path(std::move(p))
     {
         std::scoped_lock lk(this->mtx);
         this->file.open(std::filesystem::path("../") / this->path, std::ios::app | std::ios::binary);

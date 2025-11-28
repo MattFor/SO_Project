@@ -2,7 +2,7 @@
 // Created by MattFor on 26.11.2025.
 //
 
-#include "Logger.h"
+#include "../../include/logger/Logger.h"
 
 
 void Logger::log(const std::string_view line)

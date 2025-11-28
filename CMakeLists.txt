@@ -8,9 +8,9 @@ include_directories(include)
 
 add_executable(SO_Project
         main.cpp
-        src/Logger.cpp
-        src/LoggerService.cpp
-        include/LoggerService.h
+        src/logger/Logger.cpp
+        src/logger/LoggerService.cpp
+        include/logger/LoggerService.h
 )
 
 # windows networking support
