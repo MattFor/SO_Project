@@ -3,7 +3,7 @@ project(SO_Project LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 26)
 
-# headers
+# Headers
 include_directories(include)
 
 add_executable(SO_Project
@@ -13,7 +13,7 @@ add_executable(SO_Project
         include/logger/LoggerService.h
 )
 
-# windows networking support
+# Windows networking support
 if (WIN32)
     target_compile_definitions(SO_Project PRIVATE WIN32_LEAN_AND_MEAN)
     target_link_libraries(SO_Project PRIVATE ws2_32)

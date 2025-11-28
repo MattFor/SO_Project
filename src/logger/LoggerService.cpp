@@ -108,7 +108,7 @@ void LoggerService::accept_loop(const std::stop_token& st)
         }
 
         // Handle each client in its own jthread
-        std::jthread{[this, client_fd](std::stop_token) { handle_client(client_fd); }}.detach();
+        std::jthread{[this, client_fd](const std::stop_token&) { handle_client(client_fd); }}.detach();
     }
 }
 
@@ -167,6 +167,7 @@ void LoggerService::handle_client(const int client_fd)
             this->logger.log(line);
             pos = nl + 1;
         }
+
         // Remove processed prefix
         if (pos > 0)
         {
