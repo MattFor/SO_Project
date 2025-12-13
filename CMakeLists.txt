@@ -11,6 +11,10 @@ add_executable(SO_Project
         src/logger/Logger.cpp
         src/logger/LoggerService.cpp
         include/logger/LoggerService.h
+        src/patient/Patient.cpp
+        include/patient/Patient.h
+        src/patient/PatientGenerator.cpp
+        include/patient/PatientGenerator.h
 )
 
 # Windows networking support

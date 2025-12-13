@@ -1,5 +1,5 @@
 //
-// Created by MattFor on 26.11.2025.
+// Created by MattFor on 26/11/2025.
 //
 
 #ifndef SO_PROJECT_LOGGER_H

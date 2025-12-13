@@ -11,7 +11,7 @@ void LoggerService::start()
 {
     if (this->running.exchange(true))
     {
-        return; // Already running
+        return;
     }
 
     socket_startup();
