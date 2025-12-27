@@ -36,6 +36,10 @@ static std::mutex       g_patient_mutex;
 static bool             exit_on_no_patients = false;
 static std::atomic_bool g_shutdown_requested{false};
 
+static std::atomic_bool g_ipc_lost{false};        // Set by check_ipc_presence()
+static std::atomic_bool g_signal_received{false}; // Set by real signal handler
+static std::atomic_int  g_signal_number{0};       // Which signal was seen
+
 static void log_master(const std::string& s)
 {
 	if (master_log)
@@ -52,6 +56,99 @@ static void log_master(const std::string& s)
 static bool is_pid_alive(pid_t pid)
 {
 	return pid > 0 && (kill(pid, 0) == 0 || errno == EPERM);
+}
+
+// Async signal safe handler, only sets atomics
+static void shutdown_signal_handler(int signum)
+{
+	g_signal_number.store(signum);
+	g_signal_received.store(true);
+}
+
+static std::string strip_leading_slash(const char* name)
+{
+	if (!name)
+	{
+		return {};
+	}
+
+    std::string s(name);
+    if (!s.empty() && s[0] == '/')
+    {
+	    s.erase(0, 1);
+    }
+
+    return s;
+}
+
+// Return true if all monitored IPC objects are present on the filesystem
+static bool check_ipc_presence_and_report()
+{
+    // Paths for POSIX IPC
+    // - shared memory: /dev/shm/
+    // - semaphores: /dev/shm/sem.
+    // - message queues: /dev/mqueue/
+
+    std::vector<std::string> missing;
+
+    // SHM
+    {
+        std::string s = strip_leading_slash(SHM_NAME);
+        std::string path = std::string("/dev/shm/") + s;
+        if (access(path.c_str(), F_OK) != 0)
+            missing.push_back(path);
+    }
+
+    // SEM
+    {
+        std::string s = strip_leading_slash(SEM_SHM_NAME);
+        std::string path = std::string("/dev/shm/sem.") + s;
+        if (access(path.c_str(), F_OK) != 0)
+            missing.push_back(path);
+    }
+
+    // Message queues
+    {
+        std::string s = strip_leading_slash(MQ_REG_NAME);
+        std::string path = std::string("/dev/mqueue/") + s;
+        if (access(path.c_str(), F_OK) != 0)
+        {
+            missing.push_back(path);
+        }
+    }
+    {
+        std::string s = strip_leading_slash(MQ_TRIAGE_NAME);
+        std::string path = std::string("/dev/mqueue/") + s;
+        if (access(path.c_str(), F_OK) != 0)
+        {
+            missing.push_back(path);
+        }
+    }
+    {
+        std::string s = strip_leading_slash(MQ_DOCTOR_NAME);
+        std::string path = std::string("/dev/mqueue/") + s;
+        if (access(path.c_str(), F_OK) != 0)
+        {
+            missing.push_back(path);
+        }
+    }
+
+    if (!missing.empty())
+    {
+        std::ostringstream oss;
+        oss << "check_ipc_presence: detected missing IPC objects:";
+        for (auto &m : missing)
+        {
+	        oss << " " << m;
+        }
+        log_master(oss.str());
+
+        // Indicate loss (main loop will act on this)
+        g_ipc_lost.store(true);
+        return false;
+    }
+
+    return true;
 }
 
 // Get current message counts for MQs (best-effort). returns -1 on error.
@@ -951,6 +1048,22 @@ int main(int argc, char** argv)
 		log_master("main: sigaction failed");
 	}
 
+	struct sigaction sa2;
+	sa2.sa_handler = shutdown_signal_handler;
+	sigemptyset(&sa2.sa_mask);
+	sa2.sa_flags = 0;
+
+	if (
+		sigaction(SIGINT,  &sa2, nullptr) == -1 || // Ctrl-c
+		sigaction(SIGTERM, &sa2, nullptr) == -1 || // Kill
+		sigaction(SIGHUP,  &sa2, nullptr) == -1 || // Terminal close / hangup
+		sigaction(SIGQUIT, &sa2, nullptr) == -1    // Ctrl-\ -> quit
+	)
+	{
+		perror("sigaction KILL ACTIONS");
+		log_master("main: sigaction failed");
+	}
+
 	if (!setup_ipc())
 	{
 		log_master("main: setup_ipc failed");
@@ -1082,6 +1195,68 @@ int main(int argc, char** argv)
 	bool second_open = false;
 	while (!g_shutdown_requested)
 	{
+        if (g_signal_received.load())
+        {
+            // Only the main thread performs the shutdown actions, attempt to set shutdown flag once
+            bool do_send = false;
+            if (bool expected = false; g_shutdown_requested.compare_exchange_strong(expected, true))
+            {
+                do_send = true;
+            }
+
+            int signo = g_signal_number.load();
+            std::ostringstream oss;
+            oss << "Main: received signal " << signo << " -> initiating evacuation";
+            log_master(oss.str());
+
+            // Try to set evacuation in shared memory if possible
+            if (g_shm && g_shm_sem)
+            {
+                if (sem_wait(g_shm_sem) == -1)
+                {
+	                perror("sem_wait");
+                }
+                else
+                {
+                    g_shm->evacuation = true;
+                    if (sem_post(g_shm_sem) == -1) perror("sem_post");
+                }
+            }
+
+            if (do_send)
+            {
+                signal_all_services(reg1_pid, reg2_pid, triage_pid, doctor_pids);
+            }
+
+            // Clear the flag so it's no rehandled
+            g_signal_received.store(false);
+        }
+
+		// Monitor FS for external IPC unlinks
+        if (!g_shutdown_requested.load())
+        {
+            if (!check_ipc_presence_and_report())
+            {
+                bool did_set = false;
+                if (bool expected = false; g_shutdown_requested.compare_exchange_strong(expected, true))
+                {
+                    did_set = true;
+                }
+                log_master("Main: IPC loss detected -> triggering evacuation/cleanup (did_set=" + std::to_string(did_set) + ")");
+
+            	// Attempt to set evacuation in shared memory
+                if (g_shm_sem && sem_wait(g_shm_sem) != -1)
+                {
+                    if (g_shm) g_shm->evacuation = true;
+                    if (sem_post(g_shm_sem) == -1) perror("sem_post");
+                }
+
+                // Broadcast to services
+                signal_all_services(reg1_pid, reg2_pid, triage_pid, doctor_pids);
+                // Set g_shutdown_requested already done by compare_exchange above
+            }
+        }
+
 		if (exit_on_no_patients)
 		{
 			int treated = -1;
