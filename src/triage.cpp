@@ -16,7 +16,9 @@ static void log_tri(const std::string& s)
 	{
 		std::string t = timestamp() + " " + s + "\n";
 		if (fwrite(t.c_str(), 1, t.size(), triage_log) < 0)
+		{
 			perror("fwrite triage");
+		}
 		fflush(triage_log);
 	}
 }
@@ -67,6 +69,7 @@ int main()
 			log_tri("Short msg ignored");
 			continue;
 		}
+
 		PatientInfo p;
 		memcpy(&p, buf, sizeof(PatientInfo));
 
@@ -78,6 +81,7 @@ int main()
 			{
 				kill(p.pid, SIGRTMIN + 3);
 			}
+
 			// Not forwarded
 			continue;
 		}
@@ -87,16 +91,16 @@ int main()
 		std::string  color;
 		if (c < 0.10)
 		{
-			color = "RED";
-		} // 10%
+			color = "RED"; // 10%
+		}
 		else if (c < 0.10 + 0.35)
 		{
-			color = "YELLOW";
-		} // 35%
+			color = "YELLOW"; // 35%
+		}
 		else
 		{
-			color = "GREEN";
-		} // 55% (approx)
+			color = "GREEN";  // ~55%
+		}
 
 		log_tri("Patient id=" + std::to_string(p.id) + " triaged as " + color + (p.is_vip ? " VIP" : ""));
 

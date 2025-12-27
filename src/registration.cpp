@@ -121,6 +121,7 @@ int main(int argc, char** argv)
 		{
 			perror("sem_wait reg");
 		}
+
 		bool evac = g_shm->evacuation;
 		if (sem_post(g_shm_sem) == -1)
 		{
@@ -145,7 +146,7 @@ int main(int argc, char** argv)
 
 		if (r < static_cast<ssize_t>(sizeof(PatientInfo)))
 		{
-			// ignore bad
+			// Ignore malformed messages
 			log_reg("Received short message (ignored).");
 			continue;
 		}
@@ -218,7 +219,7 @@ int main(int argc, char** argv)
 
 			if (const int waiting = g_shm->waiting_to_register; waiting < g_shm->N_waiting_room / 3)
 			{
-				// close this window
+				// Close this window
 				if (sem_post(g_shm_sem) == -1)
 				{
 					perror("sem_post reg3");
