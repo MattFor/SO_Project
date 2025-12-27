@@ -1468,7 +1468,7 @@ int main(int argc, char** argv)
 		log_master("main: spawn_thread joined");
 	}
 
-	log_master("main: shutting down");
+	log_master("main: shutting down - final shutdown signal wave, for safety");
 	signal_all_services(reg1_pid, reg2_pid, triage_pid, doctor_pids);
 
 	if (reg2_pid > 0)
