@@ -18,6 +18,11 @@ static int       window_id = 1;
 
 static void log_reg(const std::string& s)
 {
+	if (!LOGGING)
+	{
+		return;
+	}
+
 	if (reg_log)
 	{
 		const std::string t = timestamp() + " " + s + "\n";

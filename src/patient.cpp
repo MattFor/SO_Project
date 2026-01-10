@@ -55,6 +55,11 @@ static std::atomic g_exit_reason{NONE};
 
 static void log_patient_local(const std::string& s)
 {
+	if (!LOGGING)
+	{
+		return;
+	}
+
 	const int pfd = open("../../logs/patients.log", O_CREAT | O_WRONLY | O_APPEND, IPC_MODE);
 	if (pfd == -1)
 	{

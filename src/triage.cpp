@@ -12,6 +12,11 @@ static FILE* triage_log = nullptr;
 
 static void log_tri(const std::string& s)
 {
+	if (!LOGGING)
+	{
+		return;
+	}
+
 	if (triage_log)
 	{
 		std::string t = timestamp() + " " + s + "\n";

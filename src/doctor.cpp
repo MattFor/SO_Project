@@ -10,6 +10,8 @@
 
 #include "../include/Utilities.h"
 
+#define LOGGING 0
+
 static volatile sig_atomic_t evacuation       = 0;
 static volatile sig_atomic_t leave_after_next = 0;
 static FILE*                 doc_log          = nullptr;
@@ -26,6 +28,11 @@ static void sigusr1_handler(int)
 
 static void log_doc(const std::string& s)
 {
+	if (!LOGGING)
+	{
+		return;
+	}
+
 	if (doc_log)
 	{
 		std::string t = timestamp() + " " + s + "\n";

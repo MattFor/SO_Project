@@ -42,6 +42,11 @@ static std::atomic_int  g_signal_number{0};       // Which signal was seen
 
 static void log_master(const std::string& s)
 {
+	if (!LOGGING)
+	{
+		return;
+	}
+
 	if (master_log)
 	{
 		const std::string t = timestamp() + " " + s + "\n";
@@ -984,6 +989,11 @@ static void input_thread_fn(std::atomic_bool& stop_flag, pid_t& reg1_pid, pid_t&
 
 int main(int argc, char** argv)
 {
+	if (!LOGGING)
+	{
+		std::cout << "Logging is disabled" << '\n';
+	}
+
 	if (argc < 4)
 	{
 		std::cerr << "Usage: master <N_waiting> <num_doctors> <num_patients_total>\n";

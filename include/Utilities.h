@@ -13,6 +13,8 @@
 #include <sys/wait.h>
 #include <semaphore.h>
 
+#define LOGGING 0
+
 static constexpr const char* MQ_REG_NAME    = "/er_registration_mq";
 static constexpr const char* MQ_TRIAGE_NAME = "/er_triage_mq";
 static constexpr const char* MQ_DOCTOR_NAME = "/er_doctor_mq";
