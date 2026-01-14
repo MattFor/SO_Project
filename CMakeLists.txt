@@ -22,9 +22,9 @@ endif()
 if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     if (FAST_BUILD)
         message(STATUS "FAST_BUILD=ON -> enabling aggressive optimization flags (Ofast, LTO, march=native)")
-        # core optimization flags for speed
+        # Core optimization flags for speed
         set(SPEED_FLAGS "-Ofast -march=native -funroll-loops -ffast-math -fno-math-errno -fomit-frame-pointer -fstrict-aliasing")
-        # enable LTO if available
+        # Enable LTO if available
         set(LTO_FLAGS "-flto")
         set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${SPEED_FLAGS} ${LTO_FLAGS} -DNDEBUG -pipe")
         set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ${LTO_FLAGS}")

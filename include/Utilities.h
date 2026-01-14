@@ -15,16 +15,16 @@
 
 #define LOGGING 0
 
-static constexpr const char* MQ_REG_NAME    = "/er_registration_mq";
-static constexpr const char* MQ_TRIAGE_NAME = "/er_triage_mq";
-static constexpr const char* MQ_DOCTOR_NAME = "/er_doctor_mq";
+static constexpr auto MQ_REG_NAME    = "/er_registration_mq";
+static constexpr auto MQ_TRIAGE_NAME = "/er_triage_mq";
+static constexpr auto MQ_DOCTOR_NAME = "/er_doctor_mq";
 
-static constexpr const char* SHM_NAME     = "/er_shm_ctrl";
-static constexpr const char* SEM_SHM_NAME = "/er_shm_sem";
+static constexpr auto SHM_NAME     = "/er_shm_ctrl";
+static constexpr auto SEM_SHM_NAME = "/er_shm_sem";
 
 static constexpr mode_t IPC_MODE = 0600; // Minimal perms
 
-static constexpr const char* PATIENT_CTRL_MQ_PREFIX = "/er_patient_ctrl_";
+static constexpr auto PATIENT_CTRL_MQ_PREFIX = "/er_patient_ctrl_";
 
 // Control commands for per-patient control MQ
 enum CtrlCmd : int
@@ -64,7 +64,7 @@ struct ERShared
 static constexpr size_t MAX_QUEUE_MESSAGES = 50;
 static constexpr size_t MAX_MSG_SIZE       = 512;
 
-// Ppatient struct info marshaled as string
+// Patient struct info marshaled as string
 struct PatientInfo
 {
     int  id;
@@ -77,28 +77,22 @@ struct PatientInfo
 
 inline std::string timestamp()
 {
-    timespec ts;
+    timespec ts{};
     if (clock_gettime(CLOCK_REALTIME, &ts) == -1)
     {
         perror("clock_gettime");
         return "0000-00-00 00:00:00.000";
     }
 
-    tm tm;
+    tm tm{};
     localtime_r(&ts.tv_sec, &tm);
 
     char buf[64];
-    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm);
+    strftime(buf, sizeof( buf ), "%Y-%m-%d %H:%M:%S", &tm);
 
     // Append milliseconds
     char final_buf[80];
-    std::snprintf(
-        final_buf,
-        sizeof(final_buf),
-        "%s.%03ld",
-        buf,
-        ts.tv_nsec / 1000000L
-    );
+    std::snprintf(final_buf, sizeof( final_buf ), "%s.%03ld", buf, ts.tv_nsec / 1000000L);
 
     return std::string(final_buf);
 }
