@@ -9,7 +9,7 @@ if (NOT UNIX OR APPLE)
 endif()
 
 if (NOT CMAKE_BUILD_TYPE)
-    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+    set(CMAKE_BUILD_TYPE Debug CACHE STRING "Build type" FORCE)
 endif()
 
 option(DISABLE_WARNINGS "Disable all compiler warnings" OFF)

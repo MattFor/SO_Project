@@ -23,9 +23,9 @@
 #include "../include/Utilities.h"
 
 static std::thread              g_ctrl_thread;
-static std::string              g_ctrl_mq_name;
 static std::vector<std::thread> g_child_threads;
 static std::atomic_bool         g_running{true};
+static PatientInfo g_self{};
 
 // Registration MQ reused for this process
 static mqd_t g_reg_mq = (mqd_t)-1;
@@ -91,7 +91,7 @@ static void try_raise_rlimit()
     rlimit rl{};
     if (getrlimit(RLIMIT_NOFILE, &rl) == 0)
     {
-        if (constexpr rlim_t want = 16384; rl.rlim_cur < want)
+        if (constexpr rlim_t want = 65536; rl.rlim_cur < want)
         {
             rl.rlim_cur = std::min(want, rl.rlim_max);
             if (setrlimit(RLIMIT_NOFILE, &rl) == -1)
@@ -157,7 +157,7 @@ static void setup_reg_mq_once()
     int tries = 10;
     while (tries--)
     {
-        g_reg_mq = mq_open(MQ_REG_NAME, O_WRONLY);
+        g_reg_mq = mq_open(MQ_REG_NAME, O_WRONLY | O_CLOEXEC);
         if (g_reg_mq != (mqd_t)-1)
         {
             break;
@@ -211,7 +211,7 @@ static bool send_registration(const PatientInfo& p)
     // If still not opened, try one-shot open
     if (mq_to_use == (mqd_t)-1)
     {
-        mq_to_use = mq_open(MQ_REG_NAME, O_WRONLY);
+        mq_to_use = mq_open(MQ_REG_NAME, O_WRONLY | O_CLOEXEC);
         if (mq_to_use == (mqd_t)-1)
         {
             // Cannot open registration MQ, time to give up
@@ -316,139 +316,164 @@ static void child_thread_fn(const ControlMessage& cm)
     {
         log_patient_local("child_thread: registration failed for child id=" + std::to_string(p.id));
     }
+    else
+    {
+        log_patient_local("child_thread: registration SUCCESS for child id=" + std::to_string(p.id));
+    }
 }
 
 // Control thread that listens for control messages on per-patient MQ
 // It opens the MQ by name and uses mq_timedreceive with a short timeout so it can
 // Check the g_running flag regularly and exit quickly when requested
-static void control_thread_fn(const std::string& ctrl_name)
+static void control_thread_fn()
 {
-    mq_attr attr{};
-    auto    ctrl_mq = (mqd_t)-1;
+    // Reader descriptor
+    const mqd_t ctrl_mq_rd =
+        mq_open(MQ_PATIENT_CTRL, O_RDONLY | O_CLOEXEC);
 
-    // Open the control MQ for reading (retry a bit if transient)
-    int tries = 20;
-    while (tries-- && ctrl_mq == (mqd_t)-1)
+    if (ctrl_mq_rd == (mqd_t)-1)
     {
-        ctrl_mq = mq_open(ctrl_name.c_str(), O_RDONLY);
-        if (ctrl_mq == (mqd_t)-1)
-        {
-            if (errno == ENOENT)
-            {
-                usleep(20 * 1000);
-                continue;
-            }
-
-            if (errno == EMFILE || errno == ENFILE)
-            {
-                try_raise_rlimit();
-                usleep(50 * 1000);
-                continue;
-            }
-
-            perror("mq_open (patient ctrl thread)");
-            break;
-        }
-    }
-
-    if (ctrl_mq == (mqd_t)-1)
-    {
-        log_patient_local("control_thread: failed to open ctrl_mq; control disabled");
+        log_patient_local("control_thread: failed to open shared ctrl MQ (reader)");
         return;
     }
 
-    log_patient_local(std::string("control_thread: opened ctrl mq ") + ctrl_name);
+    // Writer descriptor used only when we need to requeue messages not meant for us
+    mqd_t ctrl_mq_wr = mq_open(MQ_PATIENT_CTRL, O_WRONLY | O_CLOEXEC);
+    if (ctrl_mq_wr == (mqd_t)-1)
+    {
+        // Not fatal — we'll attempt to reopen lazily later if needed
+        log_patient_local("control_thread: could not open shared ctrl MQ (writer) at start, will retry on demand errno=" + std::to_string(errno));
+        ctrl_mq_wr = (mqd_t)-1;
+    }
 
     ControlMessage cm{};
-    char           buf[sizeof(ControlMessage)];
-    timespec       ts{};
+    // buffer must be large enough for arbitrary control message payloads
+    char buf[sizeof(ControlMessage)];
+    timespec ts{};
 
     while (g_running)
     {
+        // prepare timeout (500ms)
         if (clock_gettime(CLOCK_REALTIME, &ts) == -1)
         {
             perror("clock_gettime");
         }
-
         ts.tv_sec  += 0;
-        ts.tv_nsec += 500 * 1000 * 1000; // 500ms
+        ts.tv_nsec += 500 * 1000 * 1000;
         if (ts.tv_nsec >= 1000000000L)
         {
-            ts.tv_sec  += 1;
+            ts.tv_sec++;
             ts.tv_nsec -= 1000000000L;
         }
 
-        const ssize_t r = mq_timedreceive(ctrl_mq, buf, sizeof( buf ), nullptr, &ts);
+        unsigned int recv_prio = 0;
+        const ssize_t r = mq_timedreceive(
+            ctrl_mq_rd,
+            buf,
+            sizeof(buf),
+            &recv_prio,
+            &ts);
+
         if (r == -1)
         {
-            if (errno == ETIMEDOUT)
-            {
+            if (errno == ETIMEDOUT || errno == EINTR)
                 continue;
-            }
 
-            if (errno == EINTR)
-            {
-                continue;
-            }
-
-            perror("mq_timedreceive (patient ctrl)");
+            perror("mq_timedreceive patient ctrl");
             break;
         }
 
         if (r < static_cast<ssize_t>(sizeof(ControlMessage)))
         {
-            // Ignore malformed short message
+            // malformed/short message — log and skip
+            log_patient_local("control_thread: received short/malformed control message (len=" + std::to_string(r) + ")");
             continue;
         }
 
-        memcpy(&cm, buf, sizeof( cm ));
+        // copy into typed structure
+        memcpy(&cm, buf, sizeof(cm));
+
+        // If the message is NOT for this process, requeue it (so other patients can consume)
+        if (cm.target_pid != static_cast<int>(getpid()))
+        {
+            // ensure we have a writer descriptor
+            if (ctrl_mq_wr == (mqd_t)-1)
+            {
+                ctrl_mq_wr = mq_open(MQ_PATIENT_CTRL, O_WRONLY | O_CLOEXEC);
+                if (ctrl_mq_wr == (mqd_t)-1)
+                {
+                    log_patient_local("control_thread: re-open writer failed errno=" + std::to_string(errno));
+                    // Avoid busy looping re-trying; push the message back later
+                    // Sleep briefly to avoid tight loop and hope other consumer will handle it
+                    usleep(1000);
+                    // NOTE: message is already removed by mq_timedreceive; we couldn't requeue it.
+                    // This is unfortunate — but we'll continue trying for future messages.
+                    continue;
+                }
+            }
+
+            // Attempt to requeue with the same priority and original length 'r'
+            if (mq_send(ctrl_mq_wr, buf, static_cast<size_t>(r), recv_prio) == -1)
+            {
+                log_patient_local("control_thread: mq_send (requeue) failed errno=" + std::to_string(errno));
+                // If requeue fails, we still continue — message is lost but we logged it.
+            }
+            else
+            {
+                log_patient_local("control_thread: requeued control msg for pid=" + std::to_string(cm.target_pid) + " with prio=" + std::to_string(recv_prio));
+            }
+
+            continue; // next message
+        }
+
         if (cm.cmd == CTRL_SPAWN_CHILD)
         {
             g_child_threads.emplace_back(child_thread_fn, cm);
         }
+        else if (cm.cmd == CTRL_GOTO_DOCTOR)
+        {
+            mqd_t mq_doctor = mq_open(MQ_DOCTOR_NAME, O_WRONLY | O_CLOEXEC);
+            if (mq_doctor != (mqd_t)-1)
+            {
+                if (mq_send(
+                        mq_doctor,
+                        reinterpret_cast<char*>(&g_self),
+                        sizeof(PatientInfo),
+                        cm.priority) == -1)
+                {
+                    log_patient_local("CTRL_GOTO_DOCTOR: mq_send to doctor failed errno=" + std::to_string(errno));
+                }
+                else
+                {
+                    log_patient_local("CTRL_GOTO_DOCTOR queued (priority=" + std::to_string(cm.priority) + ")");
+                }
+                mq_close(mq_doctor);
+            }
+            else
+            {
+                log_patient_local("CTRL_GOTO_DOCTOR: mq_open doctor failed errno=" + std::to_string(errno));
+            }
+        }
         else if (cm.cmd == CTRL_DISMISS)
         {
-            log_patient_local("Dismissed by triage (CTRL_DISMISS)");
             g_exit_reason.store(DISMISSED_BY_TRIAGE);
             g_running = false;
-            break;
         }
         else if (cm.cmd == CTRL_SHUTDOWN)
         {
-            log_patient_local("Control: shutdown command received");
             g_running = false;
-            break;
-        }
-        else if (cm.cmd == CTRL_INSIDE)
-        {
-            {
-                std::lock_guard lk(slot_mutex);
-                g_registered_count.fetch_add(1);
-                log_patient_local("control: received CTRL_INSIDE -> owned_slots=" + std::to_string(g_registered_count.load()));
-            }
         }
         else
         {
-            log_patient_local("Control: unknown command received");
+            log_patient_local("control_thread: unknown cmd=" + std::to_string(static_cast<int>(cm.cmd)));
         }
     }
 
-    if (ctrl_mq != (mqd_t)-1)
-    {
-        mq_close(ctrl_mq);
-        ctrl_mq = (mqd_t)-1;
-    }
-
-    for (auto& t : g_child_threads)
-    {
-        if (t.joinable())
-        {
-            t.join();
-        }
-    }
-
-    log_patient_local("control_thread: exiting");
+    if (ctrl_mq_wr != (mqd_t)-1)
+        mq_close(ctrl_mq_wr);
+    mq_close(ctrl_mq_rd);
 }
+
 
 static void sig_treated_handler(int)
 {
@@ -549,28 +574,28 @@ static void cleanup_local()
         g_shm_sem_local = nullptr;
     }
 
-    if (!g_ctrl_mq_name.empty())
-    {
-        if (mq_unlink(g_ctrl_mq_name.c_str()) == -1 && errno != ENOENT)
-        {
-            perror("mq_unlink (patient ctrl)");
-        }
-        else
-        {
-            log_patient_local("cleanup_local: mq_unlink attempted for " + g_ctrl_mq_name);
-        }
-    }
+    // if (!g_ctrl_mq_name.empty())
+    // {
+    //     if (mq_unlink(g_ctrl_mq_name.c_str()) == -1 && errno != ENOENT)
+    //     {
+    //         perror("mq_unlink (patient ctrl)");
+    //     }
+    //     else
+    //     {
+    //         log_patient_local("cleanup_local: mq_unlink attempted for " + g_ctrl_mq_name);
+    //     }
+    // }
 }
 
 int main(const int argc, char** argv)
 {
+    try_raise_rlimit();
+
     if (argc < 4)
     {
         std::cerr << "patient <id> <age> <vip>\n";
         return 1;
     }
-
-    try_raise_rlimit();
 
     const int  id     = atoi(argv[1]);
     const int  age    = atoi(argv[2]);
@@ -582,37 +607,9 @@ int main(const int argc, char** argv)
     }
 
     const pid_t mypid = getpid();
-    char        ctrl_name_buf[256];
-    snprintf(ctrl_name_buf, sizeof( ctrl_name_buf ), "%s%u", PATIENT_CTRL_MQ_PREFIX, static_cast<unsigned>(mypid));
-    g_ctrl_mq_name = std::string(ctrl_name_buf);
-
-    // Create the control MQ create and close right away, control thread will open it for reading
-    {
-        mq_attr attr{};
-        attr.mq_flags   = 0;
-        attr.mq_maxmsg  = 16;
-        attr.mq_msgsize = sizeof(ControlMessage);
-        attr.mq_curmsgs = 0;
-
-        if (const mqd_t tmp = mq_open(g_ctrl_mq_name.c_str(), O_CREAT | O_EXCL | O_WRONLY, IPC_MODE, &attr); tmp == (mqd_t)-1)
-        {
-            if (errno == EEXIST)
-            {
-                // Already exists
-            }
-            else
-            {
-                log_patient_local("warning: failed to pre-create ctrl MQ (continuing): errno=" + std::to_string(errno));
-            }
-        }
-        else
-        {
-            mq_close(tmp);
-        }
-    }
 
     // Start control thread
-    g_ctrl_thread = std::thread(control_thread_fn, g_ctrl_mq_name);
+    g_ctrl_thread = std::thread(control_thread_fn);
 
     // Signal handlers
     struct sigaction sa1{}, sa2{}, sa3{};
@@ -643,18 +640,19 @@ int main(const int argc, char** argv)
     setup_reg_mq_once();
 
     // Prepare our own PatientInfo and send registration (adult)
-    PatientInfo self = {};
-    self.id          = id;
-    self.pid         = static_cast<int>(mypid); // Include pid so doctor can signal if using signals
-    self.age         = age;
-    self.is_vip      = is_vip;
-    strncpy(self.symptoms, "adult symptoms", sizeof( self.symptoms ) - 1);
-    self.symptoms[sizeof( self.symptoms ) - 1] = '\0';
+    g_self = {};
+    g_self.id          = id;
+    g_self.pid         = static_cast<int>(mypid);
+    g_self.age         = age;
+    g_self.is_vip      = is_vip;
+    strncpy(g_self.symptoms, "adult symptoms", sizeof(g_self.symptoms) - 1);
+    g_self.symptoms[sizeof(g_self.symptoms) - 1] = '\0';
+
 
     // Send registration
-    if (const bool ok = send_registration(self); !ok)
+    if (const bool ok = send_registration(g_self); !ok)
     {
-        log_patient_local("main: send_registration failed for adult id=" + std::to_string(self.id));
+        log_patient_local("main: send_registration failed for adult id=" + std::to_string(g_self.id));
     }
 
     while (g_running)

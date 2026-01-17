@@ -2,6 +2,8 @@
 // Created by MattFor on 21/12/2025.
 //
 
+// Utilities.h
+
 #ifndef ER_IPC_COMMON_H
 #define ER_IPC_COMMON_H
 
@@ -32,7 +34,8 @@ enum CtrlCmd : int
     CTRL_SPAWN_CHILD,
     CTRL_SHUTDOWN,
     CTRL_DISMISS,
-    CTRL_INSIDE
+    CTRL_INSIDE,
+    CTRL_GOTO_DOCTOR
 };
 
 struct ControlMessage
@@ -42,6 +45,9 @@ struct ControlMessage
     int  child_age;
     bool child_vip;
     char symptoms[128];
+
+    int priority;
+    int target_pid;
 };
 
 // Shared control structure in shared memory
@@ -62,7 +68,7 @@ struct ERShared
 };
 
 static constexpr size_t MAX_QUEUE_MESSAGES = 50;
-static constexpr size_t MAX_MSG_SIZE       = 512;
+static constexpr size_t MAX_MSG_SIZE       = 1024;
 
 // Patient struct info marshaled as string
 struct PatientInfo

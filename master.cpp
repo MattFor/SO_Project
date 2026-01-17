@@ -259,6 +259,7 @@ static void truncate_log_file(const std::string& path)
 static void cleanup()
 {
     log_master("cleanup: starting cleanup()");
+
     if (master_log)
     {
         fclose(master_log);
@@ -273,86 +274,42 @@ static void cleanup()
 
     if (g_shm)
     {
-        if (munmap(g_shm, sizeof(ERShared)) == -1)
-        {
-            perror("munmap");
-        }
+        munmap(g_shm, sizeof(ERShared));
         g_shm = nullptr;
     }
 
     if (g_shm_fd != -1)
     {
-        if (close(g_shm_fd) == -1)
-        {
-            perror("close(g_shm_fd)");
-        }
-
-        if (shm_unlink(SHM_NAME) == -1)
-        {
-            if (errno != ENOENT)
-            {
-                perror("shm_unlink");
-            }
-            else
-            {
-                log_master("cleanup: shm_unlink returned ENOENT");
-            }
-        }
-
+        close(g_shm_fd);
+        shm_unlink(SHM_NAME);
         g_shm_fd = -1;
     }
 
     if (g_shm_sem)
     {
-        if (sem_close(g_shm_sem) == -1)
-        {
-            perror("sem_close");
-        }
-
-        if (sem_unlink(SEM_SHM_NAME) == -1)
-        {
-            if (errno != ENOENT)
-            {
-                perror("sem_unlink");
-            }
-            else
-            {
-                log_master("cleanup: sem_unlink returned ENOENT");
-            }
-        }
-
+        sem_close(g_shm_sem);
+        sem_unlink(SEM_SHM_NAME);
         g_shm_sem = nullptr;
     }
 
-    if (mq_unlink(MQ_REG_NAME) == -1 && errno != ENOENT)
-    {
-        perror("mq_unlink reg");
-    }
-    else
-    {
-        log_master("cleanup: mq_unlink registration attempted");
-    }
+    mq_unlink(MQ_REG_NAME);
+    mq_unlink(MQ_TRIAGE_NAME);
+    mq_unlink(MQ_DOCTOR_NAME);
 
-    if (mq_unlink(MQ_TRIAGE_NAME) == -1 && errno != ENOENT)
+    /* === NEW === */
+    if (mq_unlink(MQ_PATIENT_CTRL) == -1 && errno != ENOENT)
     {
-        perror("mq_unlink triage");
+        perror("mq_unlink patient_ctrl");
     }
     else
     {
-        log_master("cleanup: mq_unlink triage attempted");
+        log_master("cleanup: mq_unlink patient_ctrl attempted");
     }
-
-    if (mq_unlink(MQ_DOCTOR_NAME) == -1 && errno != ENOENT)
-    {
-        perror("mq_unlink doctor");
-    }
-    else
-    {
-        log_master("cleanup: mq_unlink doctor attempted");
-    }
+    /* === END NEW === */
 
     log_master("cleanup: finished cleanup()");
 }
+
 
 // SIGUSR2 => set evacuation flag in shared memory
 static void sigusr2_handler(int)
@@ -411,6 +368,7 @@ static pid_t spawn_process(const std::string& path, const std::vector<std::strin
 static bool setup_ipc()
 {
     log_master("setup_ipc: creating message queues and shared memory");
+
     mq_attr attr{};
     attr.mq_flags   = 0;
     attr.mq_maxmsg  = MAX_QUEUE_MESSAGES;
@@ -447,30 +405,49 @@ static bool setup_ipc()
     mq_close(mqd);
     log_master("setup_ipc: doctor MQ created/validated");
 
+    /* === NEW: shared patient control MQ === */
+    mq_attr ctrl_attr{};
+    ctrl_attr.mq_flags   = 0;
+    ctrl_attr.mq_maxmsg  = 1024;
+    ctrl_attr.mq_msgsize = sizeof(ControlMessage);
+    ctrl_attr.mq_curmsgs = 0;
+
+    mqd = mq_open(
+        MQ_PATIENT_CTRL,
+        O_CREAT | O_RDWR | O_CLOEXEC,
+        IPC_MODE,
+        &ctrl_attr);
+
+    if (mqd == (mqd_t)-1)
+    {
+        perror("mq_open patient_ctrl");
+        log_master(std::string("setup_ipc: mq_open patient_ctrl failed: ") + strerror(errno));
+        return false;
+    }
+    mq_close(mqd);
+    log_master("setup_ipc: shared patient control MQ created/validated");
+    /* === END NEW === */
+
     g_shm_fd = shm_open(SHM_NAME, O_CREAT | O_RDWR, IPC_MODE);
     if (g_shm_fd == -1)
     {
         perror("shm_open");
-        log_master(std::string("setup_ipc: shm_open failed: ") + strerror(errno));
         return false;
     }
-    log_master("setup_ipc: shm_open succeeded fd=" + std::to_string(g_shm_fd));
 
     if (ftruncate(g_shm_fd, sizeof(ERShared)) == -1)
     {
         perror("ftruncate");
-        log_master(std::string("setup_ipc: ftruncate failed: ") + strerror(errno));
         return false;
     }
 
-    g_shm = static_cast<ERShared*>(mmap(nullptr, sizeof(ERShared), PROT_READ | PROT_WRITE, MAP_SHARED, g_shm_fd, 0));
+    g_shm = static_cast<ERShared*>(
+        mmap(nullptr, sizeof(ERShared), PROT_READ | PROT_WRITE, MAP_SHARED, g_shm_fd, 0));
     if (g_shm == MAP_FAILED)
     {
         perror("mmap");
-        log_master(std::string("setup_ipc: mmap failed: ") + strerror(errno));
         return false;
     }
-    log_master("setup_ipc: mmap succeeded");
 
     g_shm->N_waiting_room      = g_N;
     g_shm->current_inside      = 0;
@@ -483,17 +460,18 @@ static bool setup_ipc()
     if (g_shm_sem == SEM_FAILED)
     {
         perror("sem_open");
-        log_master(std::string("setup_ipc: sem_open failed: ") + strerror(errno));
         return false;
     }
-    log_master("setup_ipc: semaphore opened");
 
     return true;
 }
 
+
 // Attempt to send a spawn-child control message to an adult patient (by pid)
 // True if send succeeded
-static bool send_spawn_child_to_patient(const pid_t target_pid, const ControlMessage& cm)
+static bool send_spawn_child_to_patient(
+    const pid_t target_pid,
+    ControlMessage cm)
 {
     if (target_pid <= 0)
     {
@@ -503,35 +481,44 @@ static bool send_spawn_child_to_patient(const pid_t target_pid, const ControlMes
 
     if (!is_pid_alive(target_pid))
     {
-        log_master("send_spawn_child_to_patient: target pid " + std::to_string(target_pid) + " not alive (skipping)");
+        log_master("send_spawn_child_to_patient: target pid " +
+                   std::to_string(target_pid) + " not alive");
         return false;
     }
 
-    char mqname[256];
-    snprintf(mqname, sizeof( mqname ), "%s%u", PATIENT_CTRL_MQ_PREFIX, static_cast<unsigned>(target_pid));
-    log_master(std::string("send_spawn_child_to_patient: attempting to open mq ") + mqname);
-    const mqd_t mq = mq_open(mqname, O_WRONLY);
+    // NEW: tag message instead of choosing MQ
+    cm.target_pid = static_cast<int>(target_pid);
+
+    const mqd_t mq = mq_open(
+        MQ_PATIENT_CTRL,
+        O_WRONLY | O_CLOEXEC);
+
     if (mq == (mqd_t)-1)
     {
-        // if queue doesn't exist yet or target died
-        log_master(std::string("send_spawn_child_to_patient: mq_open failed for ") + mqname + " : " + strerror(errno));
+        log_master("send_spawn_child_to_patient: mq_open(MQ_PATIENT_CTRL) failed: " +
+                   std::string(strerror(errno)));
         return false;
     }
-    log_master(std::string("send_spawn_child_to_patient: mq_open succeeded for ") + mqname);
 
-    if (mq_send(mq, reinterpret_cast<const char*>(&cm), sizeof( cm ), 0) == -1)
+    if (mq_send(
+            mq,
+            reinterpret_cast<const char*>(&cm),
+            sizeof(cm),
+            0) == -1)
     {
-        perror("mq_send to patient ctrl");
-        log_master(std::string("send_spawn_child_to_patient: mq_send failed: ") + strerror(errno));
+        perror("mq_send patient_ctrl");
         mq_close(mq);
         return false;
     }
 
     mq_close(mq);
-    log_master("send_spawn_child_to_patient: mq_send succeeded for child_id=" + std::to_string(cm.child_id) + " on pid=" + std::to_string(target_pid));
+    log_master("send_spawn_child_to_patient: sent CTRL_SPAWN_CHILD id=" +
+               std::to_string(cm.child_id) +
+               " to target pid=" + std::to_string(target_pid));
 
     return true;
 }
+
 
 // Send SIGUSR2 to all services (registration windows, triage, doctors)
 static void signal_all_services(const pid_t reg1, const pid_t reg2, const pid_t triage, const std::vector<pid_t>& doctors)

@@ -75,7 +75,7 @@ BIN_DIR="${BUILD_DIR}/bin"
 
 WAITING_ROOM_SIZE=1000
 DOCTORS=10
-PATIENTS=100
+PATIENTS=10000
 
 log() { printf "[%s] %s\n" "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
 die() { echo "ERROR: $*" >&2; exit 1; }
