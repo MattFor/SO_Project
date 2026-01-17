@@ -26,7 +26,7 @@ static constexpr auto SEM_SHM_NAME = "/er_shm_sem";
 
 static constexpr mode_t IPC_MODE = 0600; // Minimal perms
 
-static constexpr auto PATIENT_CTRL_MQ_PREFIX = "/er_patient_ctrl_";
+static constexpr auto MQ_PATIENT_CTRL = "/er_patient_ctrl";
 
 // Control commands for per-patient control MQ
 enum CtrlCmd : int
