@@ -109,7 +109,7 @@ int main(const int argc, char** argv)
         log_doc("Doctor " + std::to_string(doc_id) + " started treating patient id=" + std::to_string(p.id));
         // Simulate treatment time
         const int treat_ms = rng() % 800 + 200;
-        usleep(treat_ms * 1000);
+        // usleep(treat_ms * 1000);
 
         // Aftercare probabilities
         if (const double x = uni(rng); x < 0.005)

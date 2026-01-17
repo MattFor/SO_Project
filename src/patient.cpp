@@ -428,7 +428,7 @@ static void control_thread_fn()
 
         if (cm.cmd == CTRL_SPAWN_CHILD)
         {
-            g_child_threads.emplace_back(child_thread_fn, cm);
+            // g_child_threads.emplace_back(child_thread_fn, cm);
         }
         else if (cm.cmd == CTRL_GOTO_DOCTOR)
         {
