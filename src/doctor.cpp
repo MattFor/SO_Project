@@ -10,8 +10,6 @@
 
 #include "../include/Utilities.h"
 
-#define LOGGING 0
-
 static volatile sig_atomic_t evacuation       = 0;
 static volatile sig_atomic_t leave_after_next = 0;
 static FILE*                 doc_log          = nullptr;
