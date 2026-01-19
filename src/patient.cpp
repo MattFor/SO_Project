@@ -27,6 +27,10 @@ static std::vector<std::thread> g_child_threads;
 static std::atomic_bool         g_running{true};
 static PatientInfo g_self{};
 
+static std::atomic_bool g_accounted{false};
+
+static std::vector<PatientInfo> g_active_children;
+static std::mutex g_children_mutex;
 // Registration MQ reused for this process
 static mqd_t g_reg_mq = (mqd_t)-1;
 
@@ -38,6 +42,9 @@ static sem_t*    g_shm_sem_local = nullptr;
 // Ensure current_inside is decremented exactly once by this patient process
 static bool       slot_released = false;
 static std::mutex slot_mutex;
+
+static int g_ctrl_slot = -1;
+static ControlRegistry* g_ctrl_reg = nullptr;
 
 // Track how many successful registrations this process performed (adult + its children)
 static std::atomic_int g_registered_count{0};
@@ -51,7 +58,44 @@ enum ExitReason
     OTHER_SIG
 };
 
-static std::atomic g_exit_reason{NONE};
+static std::atomic<ExitReason> g_exit_reason{NONE};
+
+enum class PatientState : uint8_t
+{
+    REGISTERED,
+    WAITING_TRIAGE,
+    SENT_TO_DOCTOR,
+    TREATED,
+    DISMISSED
+};
+
+static std::atomic<PatientState> g_state{PatientState::REGISTERED};
+static std::atomic<uint64_t>     g_state_since_ns{0};
+
+static inline uint64_t now_ns()
+{
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+static inline void set_state(PatientState s)
+{
+    g_state.store(s, std::memory_order_release);
+    g_state_since_ns.store(now_ns(), std::memory_order_relaxed);
+}
+
+static inline bool should_count_as_processed()
+{
+    switch (g_exit_reason.load(std::memory_order_acquire))
+    {
+        case TREATED:
+        case DISMISSED_BY_TRIAGE:
+        case EVACUATED:
+            return true;
+        default:
+            return false;
+    }
+}
 
 static void log_patient_local(const std::string& s)
 {
@@ -85,6 +129,86 @@ static void log_patient_local(const std::string& s)
     fclose(pf);
 }
 
+static void commit_patient_exit()
+{
+    bool expected = false;
+    if (!g_accounted.compare_exchange_strong(expected, true))
+        return;
+
+    if (!should_count_as_processed())
+        return;
+
+    if (!g_shm_local || !g_shm_sem_local)
+        return;
+
+    if (sem_wait(g_shm_sem_local) == -1)
+        return;
+
+    ++g_shm_local->total_treated; // now "patients_processed"
+
+    sem_post(g_shm_sem_local);
+}
+
+static bool setup_control_registry()
+{
+    // Assume shm already mmapped by setup_shm_local; we need to set g_ctrl_reg pointer.
+    // We used the layout: ERShared at start, followed by ControlRegistry.
+    // Need to remap or compute pointer from g_shm_local (ERShared*)
+    if (!g_shm_local)
+        return false;
+
+    g_ctrl_reg = reinterpret_cast<ControlRegistry*>(
+        reinterpret_cast<char*>(g_shm_local) + sizeof(ERShared));
+    if (!g_ctrl_reg)
+        return false;
+
+    // Try to claim a slot: look for an empty slot (pid==0).
+    // Use simple linear search starting from alloc_cursor to spread allocations.
+    uint32_t start = g_ctrl_reg->alloc_cursor.fetch_add(1) % CTRL_REGISTRY_SIZE;
+    for (size_t i = 0; i < CTRL_REGISTRY_SIZE; ++i)
+    {
+        size_t idx = (start + i) % CTRL_REGISTRY_SIZE;
+        pid_t expected = 0;
+        if (std::atomic_compare_exchange_strong(
+                reinterpret_cast<std::atomic<pid_t>*>(&g_ctrl_reg->slots[idx].pid),
+                &expected,
+                static_cast<pid_t>(getpid())))
+        {
+            g_ctrl_slot = static_cast<int>(idx);
+
+            // mark seq = 0 (empty)
+            g_ctrl_reg->slots[idx].seq.store(0, std::memory_order_relaxed);
+
+            // ensure semaphore for bucket exists (create if necessary)
+            const size_t bucket = slot_to_bucket(idx);
+            const std::string sname = ctrl_sem_name(bucket);
+            sem_t* sem = sem_open(sname.c_str(), O_CREAT, IPC_MODE, 0);
+            if (sem == SEM_FAILED)
+            {
+                perror("sem_open patient register");
+                // continue: patient can still poll
+            }
+            else
+            {
+                sem_close(sem);
+            }
+
+            return true;
+        }
+    }
+    // failed to claim a slot
+    return false;
+}
+
+static void release_single_slot() {
+    if (sem_wait(g_shm_sem_local) != -1) {
+        if (g_shm_local->current_inside > 0) {
+            g_shm_local->current_inside--;
+        }
+        sem_post(g_shm_sem_local);
+    }
+}
+
 // Try to raise RLIMIT_NOFILE
 static void try_raise_rlimit()
 {
@@ -105,45 +229,36 @@ static void try_raise_rlimit()
         }
     }
 }
-
 static void release_waiting_room_slot_once()
 {
     std::lock_guard lk(slot_mutex);
-    if (slot_released)
-    {
-        return;
-    }
-
+    if (slot_released) return;
     slot_released = true;
 
-    if (!g_shm_local || !g_shm_sem_local)
-    {
-        log_patient_local("release_waiting_room_slot_once: no shm/sem available (no-op)");
-        return;
-    }
+    if (!g_shm_local || !g_shm_sem_local) return;
 
-    // Use loop to decrement exactly one owned slot if available
-    if (sem_wait(g_shm_sem_local) == -1)
-    {
+    // Lock ONCE for the entire cleanup operation
+    if (sem_wait(g_shm_sem_local) == -1) {
         perror("sem_wait (patient release)");
         return;
     }
 
-    if (const int owned = g_registered_count.load(); owned > 0 && g_shm_local->current_inside > 0)
+    // Now it's safe to loop because we hold the lock
+    while (g_registered_count.load() > 0)
     {
-        g_shm_local->current_inside--;
-        g_registered_count.fetch_sub(1);
-        log_patient_local("Released waiting room slot; current_inside -> " + std::to_string(g_shm_local->current_inside));
-    }
-    else
-    {
-        log_patient_local("Release requested but no owned slot or current_inside==0 (no-op)");
+        if (g_shm_local->current_inside > 0) {
+            g_shm_local->current_inside--;
+            g_registered_count.fetch_sub(1);
+            log_patient_local("Released slot. Remaining for this family: " +
+                              std::to_string(g_registered_count.load()));
+        } else {
+            // Building is already empty, nothing left to decrement
+            break;
+        }
     }
 
-    if (sem_post(g_shm_sem_local) == -1)
-    {
-        perror("sem_post (patient release)");
-    }
+    // Release ONCE after the loop finishes
+    sem_post(g_shm_sem_local);
 }
 
 // Open registration MQ once (writer) with a small retry/backoff thing
@@ -288,7 +403,10 @@ static bool send_registration(const PatientInfo& p)
 
     // Success
     log_patient_local("Registered patient id=" + std::to_string(p.id) + " age=" + std::to_string(p.age) + ( p.is_vip ? " VIP" : "" ));
+
+    if (p.pid != 0) {
     g_registered_count.fetch_add(1);
+}
 
     if (used_tmp && mq_to_use != (mqd_t)-1)
     {
@@ -304,21 +422,22 @@ static void child_thread_fn(const ControlMessage& cm)
 {
     PatientInfo p{};
     p.id     = cm.child_id;
-    p.pid    = 0; // Child is not a persistent process
+    p.pid    = getpid(); // 🔑 FIX: Use Parent PID so Dispatcher can find the slot
     p.age    = cm.child_age;
     p.is_vip = cm.child_vip;
-    strncpy(p.symptoms, cm.symptoms, sizeof( p.symptoms ) - 1);
-    p.symptoms[sizeof( p.symptoms ) - 1] = '\0';
+    strncpy(p.symptoms, cm.symptoms, sizeof(p.symptoms) - 1);
+    p.symptoms[sizeof(p.symptoms) - 1] = '\0';
 
-    log_patient_local("Spawned child-thread id=" + std::to_string(p.id) + " age=" + std::to_string(p.age) + ( p.is_vip ? " VIP" : "" ));
-
-    if (const bool ok = send_registration(p); !ok)
     {
-        log_patient_local("child_thread: registration failed for child id=" + std::to_string(p.id));
+        std::lock_guard<std::mutex> lock(g_children_mutex);
+        g_active_children.push_back(p);
     }
-    else
-    {
-        log_patient_local("child_thread: registration SUCCESS for child id=" + std::to_string(p.id));
+
+    log_patient_local("Spawned child-thread id=" + std::to_string(p.id) + " using Parent PID=" + std::to_string(p.pid));
+
+    if (!send_registration(p)) {
+        g_registered_count.fetch_add(1);
+        log_patient_local("child_thread: registration failed for child id=" + std::to_string(p.id));
     }
 }
 
@@ -327,111 +446,72 @@ static void child_thread_fn(const ControlMessage& cm)
 // Check the g_running flag regularly and exit quickly when requested
 static void control_thread_fn()
 {
-    // Reader descriptor
-    const mqd_t ctrl_mq_rd =
-        mq_open(MQ_PATIENT_CTRL, O_RDONLY | O_CLOEXEC);
-
-    if (ctrl_mq_rd == (mqd_t)-1)
+	 if (!g_ctrl_reg || g_ctrl_slot < 0)
     {
-        log_patient_local("control_thread: failed to open shared ctrl MQ (reader)");
+        log_patient_local("control_thread: no control registry available; exiting");
         return;
     }
 
-    // Writer descriptor used only when we need to requeue messages not meant for us
-    mqd_t ctrl_mq_wr = mq_open(MQ_PATIENT_CTRL, O_WRONLY | O_CLOEXEC);
-    if (ctrl_mq_wr == (mqd_t)-1)
-    {
-        // Not fatal — we'll attempt to reopen lazily later if needed
-        log_patient_local("control_thread: could not open shared ctrl MQ (writer) at start, will retry on demand errno=" + std::to_string(errno));
-        ctrl_mq_wr = (mqd_t)-1;
-    }
+    const size_t bucket = slot_to_bucket(static_cast<size_t>(g_ctrl_slot));
+    const std::string sname = ctrl_sem_name(bucket);
 
-    ControlMessage cm{};
-    // buffer must be large enough for arbitrary control message payloads
-    char buf[sizeof(ControlMessage)];
-    timespec ts{};
+    // Open the semaphore once and reuse
+    sem_t* sem = sem_open(sname.c_str(), 0);
+    if (sem == SEM_FAILED)
+    {
+        log_patient_local("control_thread: sem_open failed, will fallback to polling");
+    }
 
     while (g_running)
     {
-        // prepare timeout (500ms)
-        if (clock_gettime(CLOCK_REALTIME, &ts) == -1)
+        bool woke = false;
+
+        if (sem != SEM_FAILED)
         {
-            perror("clock_gettime");
+            // Wait until dispatcher posts the bucket
+            if (sem_wait(sem) == -1)
+            {
+                if (errno == EINTR) continue;
+                perror("sem_wait patient ctrl");
+                break;
+            }
+            woke = true;
         }
-        ts.tv_sec  += 0;
-        ts.tv_nsec += 500 * 1000 * 1000;
-        if (ts.tv_nsec >= 1000000000L)
+        else
         {
-            ts.tv_sec++;
-            ts.tv_nsec -= 1000000000L;
-        }
-
-        unsigned int recv_prio = 0;
-        const ssize_t r = mq_timedreceive(
-            ctrl_mq_rd,
-            buf,
-            sizeof(buf),
-            &recv_prio,
-            &ts);
-
-        if (r == -1)
-        {
-            if (errno == ETIMEDOUT || errno == EINTR)
-                continue;
-
-            perror("mq_timedreceive patient ctrl");
-            break;
+            // fallback: simple sleep/poll
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            woke = true;
         }
 
-        if (r < static_cast<ssize_t>(sizeof(ControlMessage)))
+        if (!g_running) break;
+
+        // check our slot
+        ControlSlot& slot = g_ctrl_reg->slots[static_cast<size_t>(g_ctrl_slot)];
+        const uint32_t seq = slot.seq.load(std::memory_order_acquire);
+        if (seq == 0)
         {
-            // malformed/short message — log and skip
-            log_patient_local("control_thread: received short/malformed control message (len=" + std::to_string(r) + ")");
+            // spurious wake or no msg
             continue;
         }
 
-        // copy into typed structure
-        memcpy(&cm, buf, sizeof(cm));
+        // copy message locally
+        ControlMessage cm;
+        cm = slot.msg;
 
-        // If the message is NOT for this process, requeue it (so other patients can consume)
-        if (cm.target_pid != static_cast<int>(getpid()))
-        {
-            // ensure we have a writer descriptor
-            if (ctrl_mq_wr == (mqd_t)-1)
-            {
-                ctrl_mq_wr = mq_open(MQ_PATIENT_CTRL, O_WRONLY | O_CLOEXEC);
-                if (ctrl_mq_wr == (mqd_t)-1)
-                {
-                    log_patient_local("control_thread: re-open writer failed errno=" + std::to_string(errno));
-                    // Avoid busy looping re-trying; push the message back later
-                    // Sleep briefly to avoid tight loop and hope other consumer will handle it
-                    usleep(1000);
-                    // NOTE: message is already removed by mq_timedreceive; we couldn't requeue it.
-                    // This is unfortunate — but we'll continue trying for future messages.
-                    continue;
-                }
-            }
+        // clear slot (set seq to 0)
+        slot.seq.store(0, std::memory_order_release);
 
-            // Attempt to requeue with the same priority and original length 'r'
-            if (mq_send(ctrl_mq_wr, buf, static_cast<size_t>(r), recv_prio) == -1)
-            {
-                log_patient_local("control_thread: mq_send (requeue) failed errno=" + std::to_string(errno));
-                // If requeue fails, we still continue — message is lost but we logged it.
-            }
-            else
-            {
-                log_patient_local("control_thread: requeued control msg for pid=" + std::to_string(cm.target_pid) + " with prio=" + std::to_string(recv_prio));
-            }
-
-            continue; // next message
-        }
-
+        // Handle message (same handling as before)
         if (cm.cmd == CTRL_SPAWN_CHILD)
         {
-            // g_child_threads.emplace_back(child_thread_fn, cm);
+            // create child thread
+            g_child_threads.emplace_back(child_thread_fn, cm);
         }
         else if (cm.cmd == CTRL_GOTO_DOCTOR)
         {
+	set_state(PatientState::SENT_TO_DOCTOR);
+
             mqd_t mq_doctor = mq_open(MQ_DOCTOR_NAME, O_WRONLY | O_CLOEXEC);
             if (mq_doctor != (mqd_t)-1)
             {
@@ -456,6 +536,7 @@ static void control_thread_fn()
         }
         else if (cm.cmd == CTRL_DISMISS)
         {
+set_state(PatientState::DISMISSED);
             g_exit_reason.store(DISMISSED_BY_TRIAGE);
             g_running = false;
         }
@@ -469,26 +550,28 @@ static void control_thread_fn()
         }
     }
 
-    if (ctrl_mq_wr != (mqd_t)-1)
-        mq_close(ctrl_mq_wr);
-    mq_close(ctrl_mq_rd);
+    if (sem != SEM_FAILED)
+        sem_close(sem);
 }
 
 
 static void sig_treated_handler(int)
 {
+set_state(PatientState::TREATED);
     g_exit_reason.store(TREATED);
     g_running = false;
 }
 
 static void sigusr2_handler(int)
 {
+ set_state(PatientState::DISMISSED);
     g_exit_reason.store(EVACUATED);
     g_running = false;
 }
 
 static void sig_dismissed_handler(int)
 {
+ set_state(PatientState::DISMISSED);
     g_exit_reason.store(DISMISSED_BY_TRIAGE);
     g_running = false;
 }
@@ -502,27 +585,37 @@ static bool setup_shm_local()
         return false;
     }
 
-    g_shm_local = static_cast<ERShared*>(mmap(nullptr, sizeof(ERShared), PROT_READ | PROT_WRITE, MAP_SHARED, g_shm_fd_local, 0));
-    if (g_shm_local == MAP_FAILED)
+    const size_t total_shm_sz = sizeof(ERShared) + sizeof(ControlRegistry);
+
+    void* p = mmap(nullptr, total_shm_sz, PROT_READ | PROT_WRITE, MAP_SHARED, g_shm_fd_local, 0);
+    if (p == MAP_FAILED)
     {
         perror("mmap (patient)");
         g_shm_local = nullptr;
         return false;
     }
 
+    // ERShared is at the start, ControlRegistry follows immediately
+    g_shm_local = reinterpret_cast<ERShared*>(p);
+    g_ctrl_reg  = reinterpret_cast<ControlRegistry*>(
+                      reinterpret_cast<char*>(p) + sizeof(ERShared));
+
     g_shm_sem_local = sem_open(SEM_SHM_NAME, 0);
     if (g_shm_sem_local == SEM_FAILED)
     {
         perror("sem_open (patient)");
         g_shm_sem_local = nullptr;
-        return true;
+        // still return true because shared memory mapping succeeded
     }
 
     return true;
 }
 
+
 static void cleanup_local()
 {
+release_waiting_room_slot_once();
+	commit_patient_exit();
     g_running = false;
 
     if (g_ctrl_thread.joinable())
@@ -544,14 +637,35 @@ static void cleanup_local()
         g_reg_mq = (mqd_t)-1;
     }
 
-    if (g_shm_local)
+if (g_ctrl_reg && g_ctrl_slot >= 0)
     {
-        if (munmap(g_shm_local, sizeof(ERShared)) == -1)
+        // set pid back to 0 atomically
+        g_ctrl_reg->slots[static_cast<size_t>(g_ctrl_slot)].pid.store(0, std::memory_order_release);
+
+        // Optionally bump seq to zero (already should be 0 after processing)
+        g_ctrl_reg->slots[static_cast<size_t>(g_ctrl_slot)].seq.store(0, std::memory_order_release);
+
+        // post the bucket semaphore once in case anyone is waiting for this slot to appear/disappear
+        const size_t bucket = slot_to_bucket(static_cast<size_t>(g_ctrl_slot));
+        const std::string sname = ctrl_sem_name(bucket);
+        sem_t* sem = sem_open(sname.c_str(), 0);
+        if (sem != SEM_FAILED)
         {
-            perror("munmap (patient)");
+            sem_post(sem);
+            sem_close(sem);
         }
 
-        g_shm_local = nullptr;
+        g_ctrl_slot = -1;
+    }
+
+    if (g_shm_local)
+    {
+        const size_t total_shm_sz = sizeof(ERShared) + sizeof(ControlRegistry);
+if (munmap(g_shm_local, total_shm_sz) == -1)
+{
+    perror("munmap (patient)");
+}
+g_shm_local = nullptr;
     }
 
     if (g_shm_fd_local != -1)
@@ -573,22 +687,11 @@ static void cleanup_local()
 
         g_shm_sem_local = nullptr;
     }
-
-    // if (!g_ctrl_mq_name.empty())
-    // {
-    //     if (mq_unlink(g_ctrl_mq_name.c_str()) == -1 && errno != ENOENT)
-    //     {
-    //         perror("mq_unlink (patient ctrl)");
-    //     }
-    //     else
-    //     {
-    //         log_patient_local("cleanup_local: mq_unlink attempted for " + g_ctrl_mq_name);
-    //     }
-    // }
 }
 
 int main(const int argc, char** argv)
 {
+atexit(cleanup_local);
     try_raise_rlimit();
 
     if (argc < 4)
@@ -607,6 +710,20 @@ int main(const int argc, char** argv)
     }
 
     const pid_t mypid = getpid();
+
+	if (g_shm_local)
+{
+    if (!setup_control_registry())
+    {
+        log_patient_local("setup_control_registry: failed to claim a slot (continuing, but will not receive control messages)");
+        // We still proceed, but control thread will notice no slot and exit
+    }
+    else
+    {
+        log_patient_local("setup_control_registry: claimed slot=" + std::to_string(g_ctrl_slot));
+    }
+}
+
 
     // Start control thread
     g_ctrl_thread = std::thread(control_thread_fn);
@@ -655,10 +772,40 @@ int main(const int argc, char** argv)
         log_patient_local("main: send_registration failed for adult id=" + std::to_string(g_self.id));
     }
 
-    while (g_running)
+	set_state(PatientState::WAITING_TRIAGE);
+
+constexpr uint64_t STUCK_TIMEOUT_NS =
+    3ull * 1000 * 1000 * 1000; // 2 seconds
+
+while (g_running)
+{
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+    const auto     state = g_state.load(std::memory_order_acquire);
+    const uint64_t idle  = now_ns() - g_state_since_ns.load();
+
+    // Stuck waiting for triage decision
+    if ((state == PatientState::REGISTERED ||
+         state == PatientState::WAITING_TRIAGE) &&
+        idle > STUCK_TIMEOUT_NS)
     {
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        log_patient_local("WATCHDOG: stuck before triage → self-dismiss");
+        set_state(PatientState::DISMISSED);
+        g_exit_reason.store(DISMISSED_BY_TRIAGE);
+        break;
     }
+
+    // Stuck after being sent to doctor
+    if (state == PatientState::SENT_TO_DOCTOR &&
+        idle > STUCK_TIMEOUT_NS)
+    {
+        log_patient_local("WATCHDOG: doctor never treated → self-dismiss");
+        set_state(PatientState::DISMISSED);
+        g_exit_reason.store(DISMISSED_BY_TRIAGE);
+        break;
+    }
+}
+
 
     g_running = false;
 
@@ -674,48 +821,6 @@ int main(const int argc, char** argv)
             t.join();
         }
     }
-
-    release_waiting_room_slot_once();
-
-    if (g_shm_local && g_shm_sem_local)
-    {
-        if (const int remaining = g_registered_count.load(); remaining > 0)
-        {
-            log_patient_local("Final reclaim: attempting to release up to " + std::to_string(remaining) + " outstanding registrations");
-            for (int i = 0; i < remaining; i++)
-            {
-                if (sem_wait(g_shm_sem_local) == -1)
-                {
-                    perror("sem_wait (patient final reclaim)");
-                    break;
-                }
-
-                if (g_shm_local->current_inside > 0)
-                {
-                    g_shm_local->current_inside--;
-                    log_patient_local("Final reclaim: decremented current_inside -> " + std::to_string(g_shm_local->current_inside));
-                    g_registered_count.fetch_sub(1);
-                }
-                else
-                {
-                    if (sem_post(g_shm_sem_local) == -1)
-                    {
-                        perror("sem_post (patient final reclaim)");
-                    }
-
-                    break;
-                }
-
-                if (sem_post(g_shm_sem_local) == -1)
-                {
-                    perror("sem_post (patient final reclaim)");
-                    break;
-                }
-            }
-        }
-    }
-
-    cleanup_local();
 
     switch (g_exit_reason.load())
     {
