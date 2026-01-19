@@ -1500,7 +1500,7 @@ int main(int argc, char** argv)
 
         for (int i = 0; i < num_patients && !g_shutdown_requested.load(); i++)
         {
-            int  age      = rng() % 80 + 100;
+            int  age      = rng() % 80 + 1;
             bool is_child = age < 18;
             bool is_vip   = rng() % 100 < 5;
 

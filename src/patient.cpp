@@ -255,7 +255,7 @@ static void try_raise_rlimit()
         }
     }
 }
-static void release_waiting_room_slot_once()
+void release_waiting_room_slot_once()
 {
     std::lock_guard lk(slot_mutex);
     if (slot_released) return;
@@ -263,29 +263,20 @@ static void release_waiting_room_slot_once()
 
     if (!g_shm_local || !g_shm_sem_local) return;
 
-    // Lock ONCE for the entire cleanup operation
-    if (sem_wait(g_shm_sem_local) == -1) {
-        perror("sem_wait (patient release)");
-        return;
-    }
+    if (sem_wait(g_shm_sem_local) == -1) return;
 
-    // Now it's safe to loop because we hold the lock
-    while (g_registered_count.load() > 0)
+    // Batch decrement
+    int remaining = g_registered_count.exchange(0);
+    if (remaining > 0 && g_shm_local->current_inside > 0)
     {
-        if (g_shm_local->current_inside > 0) {
-            g_shm_local->current_inside--;
-            g_registered_count.fetch_sub(1);
-            log_patient_local("Released slot. Remaining for this family: " +
-                              std::to_string(g_registered_count.load()));
-        } else {
-            // Building is already empty, nothing left to decrement
-            break;
-        }
+        int to_release = std::min(remaining, static_cast<int>(g_shm_local->current_inside));
+        g_shm_local->current_inside -= to_release;
+        log_patient_local("Released slots in batch: " + std::to_string(to_release));
     }
 
-    // Release ONCE after the loop finishes
     sem_post(g_shm_sem_local);
 }
+
 
 // Open registration MQ once (writer) with a small retry/backoff thing
 static void setup_reg_mq_once()
@@ -506,7 +497,7 @@ static void control_thread_fn()
         else
         {
             // fallback: simple sleep/poll
-            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
             woke = true;
         }
 
@@ -881,7 +872,7 @@ constexpr uint64_t STUCK_TIMEOUT_NS =
 
 while (g_running)
 {
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
 
     const auto     state = g_state.load(std::memory_order_acquire);
     const uint64_t idle  = now_ns() - g_state_since_ns.load();
