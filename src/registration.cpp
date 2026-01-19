@@ -84,12 +84,19 @@ int main(const int argc, char** argv)
         return 1;
     }
 
-    g_shm = static_cast<ERShared*>(mmap(nullptr, sizeof(ERShared), PROT_READ | PROT_WRITE, MAP_SHARED, g_shm_fd, 0));
-    if (g_shm == MAP_FAILED)
-    {
-        perror("mmap reg");
-        return 1;
-    }
+g_shm = static_cast<ERShared*>(
+    mmap(nullptr, sizeof(ERShared),
+         PROT_READ | PROT_WRITE,
+         MAP_SHARED,
+         g_shm_fd,
+         0));
+
+if (g_shm == MAP_FAILED)
+{
+    perror("mmap reg");
+    return 1;
+}
+
 
     g_shm_sem = sem_open(SEM_SHM_NAME, 0);
     if (g_shm_sem == SEM_FAILED)
