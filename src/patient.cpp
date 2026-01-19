@@ -1,3 +1,5 @@
+
+
 //
 // Created by MattFor on 21/12/2025.
 //
@@ -83,7 +85,27 @@ static inline void set_state(PatientState s)
     g_state.store(s, std::memory_order_release);
     g_state_since_ns.store(now_ns(), std::memory_order_relaxed);
 }
+/*
+static inline bool should_count_as_processed()
+{
+    const auto state = g_state.load(std::memory_order_acquire);
+    const auto exit  = g_exit_reason.load(std::memory_order_acquire);
 
+    // Must have been admitted / visible to the system
+if (g_exit_reason.load() == NONE)
+    return false;
+
+    // Only count terminal decisions
+    switch (exit)
+    {
+        case TREATED:
+        case DISMISSED_BY_TRIAGE:
+        case EVACUATED:
+            return true;
+        default:
+            return false;
+    }
+}*/
 static inline bool should_count_as_processed()
 {
     switch (g_exit_reason.load(std::memory_order_acquire))
@@ -96,6 +118,8 @@ static inline bool should_count_as_processed()
             return false;
     }
 }
+
+
 
 static void log_patient_local(const std::string& s)
 {
@@ -148,6 +172,8 @@ static void commit_patient_exit()
 
     sem_post(g_shm_sem_local);
 }
+
+
 
 static bool setup_control_registry()
 {
@@ -436,7 +462,7 @@ static void child_thread_fn(const ControlMessage& cm)
     log_patient_local("Spawned child-thread id=" + std::to_string(p.id) + " using Parent PID=" + std::to_string(p.pid));
 
     if (!send_registration(p)) {
-        g_registered_count.fetch_add(1);
+        //g_registered_count.fetch_add(1);
         log_patient_local("child_thread: registration failed for child id=" + std::to_string(p.id));
     }
 }
@@ -502,36 +528,100 @@ static void control_thread_fn()
         // clear slot (set seq to 0)
         slot.seq.store(0, std::memory_order_release);
 
-        // Handle message (same handling as before)
+        // Handle message (saqme handling as before)
         if (cm.cmd == CTRL_SPAWN_CHILD)
         {
             // create child thread
-            g_child_threads.emplace_back(child_thread_fn, cm);
+           // g_child_threads.emplace_back(child_thread_fn, cm);
         }
-        else if (cm.cmd == CTRL_GOTO_DOCTOR)
+       else if (cm.cmd == CTRL_GOTO_DOCTOR)
         {
-	set_state(PatientState::SENT_TO_DOCTOR);
-
-            mqd_t mq_doctor = mq_open(MQ_DOCTOR_NAME, O_WRONLY | O_CLOEXEC);
-            if (mq_doctor != (mqd_t)-1)
+            // If this control message targets a child (target_id != 0 and not the adult id),
+            // locate the child in g_active_children and forward the child's PatientInfo to doctor MQ.
+if (cm.target_id != 0 && cm.target_id != g_self.id)
+    {
+        PatientInfo child{};
+        bool found = false;
+        {
+            std::lock_guard<std::mutex> lock(g_children_mutex);
+            for (auto it = g_active_children.begin(); it != g_active_children.end(); ++it)
             {
-                if (mq_send(
-                        mq_doctor,
-                        reinterpret_cast<char*>(&g_self),
-                        sizeof(PatientInfo),
-                        cm.priority) == -1)
+                if (it->id == cm.target_id)
                 {
-                    log_patient_local("CTRL_GOTO_DOCTOR: mq_send to doctor failed errno=" + std::to_string(errno));
+                    child = *it;
+                    g_active_children.erase(it);
+                    found = true;
+                    break;
+                }
+            }
+        }
+
+        if (!found)
+        {
+            log_patient_local("CTRL_GOTO_DOCTOR: target child id not found id=" + std::to_string(cm.target_id));
+        }
+        else
+        {
+            // Bookkeeping: decrement local registered count and shared current_inside
+            g_registered_count.fetch_sub(1);
+
+            if (g_shm_local && g_shm_sem_local)
+            {
+                if (sem_wait(g_shm_sem_local) != -1)
+                {
+                    if (g_shm_local->current_inside > 0)
+                        g_shm_local->current_inside--;
+                    if (g_shm_local->waiting_to_register > 0)
+                        g_shm_local->waiting_to_register--; // optional: if you incremented earlier
+                    sem_post(g_shm_sem_local);
                 }
                 else
                 {
-                    log_patient_local("CTRL_GOTO_DOCTOR queued (priority=" + std::to_string(cm.priority) + ")");
+                    perror("sem_wait (patient forward child)");
+                }
+            }
+
+            // Forward child to doctor MQ
+            mqd_t mq_doctor = mq_open(MQ_DOCTOR_NAME, O_WRONLY | O_CLOEXEC);
+            if (mq_doctor != (mqd_t)-1)
+            {
+                if (mq_send(mq_doctor, reinterpret_cast<char*>(&child), sizeof(PatientInfo), cm.priority) == -1)
+                {
+                    log_patient_local("CTRL_GOTO_DOCTOR: mq_send child to doctor failed errno=" + std::to_string(errno));
+                }
+                else
+                {
+                    log_patient_local("CTRL_GOTO_DOCTOR queued for child id=" + std::to_string(child.id) + " (priority=" + std::to_string(cm.priority) + ")");
                 }
                 mq_close(mq_doctor);
             }
             else
             {
                 log_patient_local("CTRL_GOTO_DOCTOR: mq_open doctor failed errno=" + std::to_string(errno));
+            }
+        }
+    }
+            else
+            {
+                // Default: this targets the adult patient — unchanged behavior
+                set_state(PatientState::SENT_TO_DOCTOR);
+                mqd_t mq_doctor = mq_open(MQ_DOCTOR_NAME, O_WRONLY | O_CLOEXEC);
+                if (mq_doctor != (mqd_t)-1)
+                {
+                    if (mq_send(mq_doctor, reinterpret_cast<char*>(&g_self), sizeof(PatientInfo), cm.priority) == -1)
+                    {
+                        log_patient_local("CTRL_GOTO_DOCTOR: mq_send to doctor failed errno=" + std::to_string(errno));
+                    }
+                    else
+                    {
+                        log_patient_local("CTRL_GOTO_DOCTOR queued (priority=" + std::to_string(cm.priority) + ")");
+                    }
+                    mq_close(mq_doctor);
+                }
+                else
+                {
+                    log_patient_local("CTRL_GOTO_DOCTOR: mq_open doctor failed errno=" + std::to_string(errno));
+                }
             }
         }
         else if (cm.cmd == CTRL_DISMISS)
@@ -687,6 +777,18 @@ g_shm_local = nullptr;
 
         g_shm_sem_local = nullptr;
     }
+
+    // if (!g_ctrl_mq_name.empty())
+    // {
+    //     if (mq_unlink(g_ctrl_mq_name.c_str()) == -1 && errno != ENOENT)
+    //     {
+    //         perror("mq_unlink (patient ctrl)");
+    //     }
+    //     else
+    //     {
+    //         log_patient_local("cleanup_local: mq_unlink attempted for " + g_ctrl_mq_name);
+    //     }
+    // }
 }
 
 int main(const int argc, char** argv)
@@ -821,6 +923,48 @@ while (g_running)
             t.join();
         }
     }
+
+    //release_waiting_room_slot_once();
+/*
+    if (g_shm_local && g_shm_sem_local)
+    {
+        if (const int remaining = g_registered_count.load(); remaining > 0)
+        {
+            log_patient_local("Final reclaim: attempting to release up to " + std::to_string(remaining) + " outstanding registrations");
+            for (int i = 0; i < remaining; i++)
+            {
+                if (sem_wait(g_shm_sem_local) == -1)
+                {
+                    perror("sem_wait (patient final reclaim)");
+                    break;
+                }
+
+                if (g_shm_local->current_inside > 0)
+                {
+                    g_shm_local->current_inside--;
+                    log_patient_local("Final reclaim: decremented current_inside -> " + std::to_string(g_shm_local->current_inside));
+                    g_registered_count.fetch_sub(1);
+                }
+                else
+                {
+                    if (sem_post(g_shm_sem_local) == -1)
+                    {
+                        perror("sem_post (patient final reclaim)");
+                    }
+
+                    break;
+                }
+
+                if (sem_post(g_shm_sem_local) == -1)
+                {
+                    perror("sem_post (patient final reclaim)");
+                    break;
+                }
+            }
+        }
+    }
+*/
+	//commit_patient_exit();
 
     switch (g_exit_reason.load())
     {

@@ -16,7 +16,7 @@
 #include <sys/wait.h>
 #include <semaphore.h>
 
-#define LOGGING 0
+#define LOGGING 1
 
 static constexpr auto MQ_REG_NAME    = "/er_registration_mq";
 static constexpr auto MQ_TRIAGE_NAME = "/er_triage_mq";

@@ -1500,13 +1500,13 @@ int main(int argc, char** argv)
 
         for (int i = 0; i < num_patients && !g_shutdown_requested.load(); i++)
         {
-            int  age      = rng() % 80 + 1;
+            int  age      = rng() % 80 + 100;
             bool is_child = age < 18;
             bool is_vip   = rng() % 100 < 5;
 
             int my_id = next_id.fetch_add(1);
 
-            if (false)
+            if (is_child)
             {
                 ControlMessage cm{};
                 cm.cmd       = CTRL_SPAWN_CHILD;
