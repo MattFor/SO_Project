@@ -9,7 +9,7 @@ if (NOT UNIX OR APPLE)
 endif()
 
 if (NOT CMAKE_BUILD_TYPE)
-    set(CMAKE_BUILD_TYPE Debug CACHE STRING "Build type" FORCE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
 option(DISABLE_WARNINGS "Disable all compiler warnings" OFF)
@@ -47,6 +47,7 @@ add_executable(registration src/registration.cpp)
 add_executable(triage src/triage.cpp)
 add_executable(doctor src/doctor.cpp)
 add_executable(patient src/patient.cpp)
+add_executable(dispatcher src/dispatcher.cpp)
 
 # Link POSIX libs
 target_link_libraries(master PRIVATE ${POSIX_LIBS})
@@ -54,17 +55,18 @@ target_link_libraries(registration PRIVATE ${POSIX_LIBS})
 target_link_libraries(triage PRIVATE ${POSIX_LIBS})
 target_link_libraries(doctor PRIVATE ${POSIX_LIBS})
 target_link_libraries(patient PRIVATE ${POSIX_LIBS})
+target_link_libraries(dispatcher PRIVATE ${POSIX_LIBS})
 
 # Set runtime output dir
 set_target_properties(
-        master registration triage doctor patient
+        master registration triage doctor patient dispatcher
         PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 
 # Enable target-level IPO/LTO for supported toolchains when FAST_BUILD=ON
 if (FAST_BUILD)
-    foreach(tgt IN ITEMS master registration triage doctor patient)
+    foreach(tgt IN ITEMS master registration triage doctor patient dispatcher)
         if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
             message(STATUS "Enabling target LTO/IPO for ${tgt}")
             set_target_properties(${tgt} PROPERTIES INTERPROCEDURAL_OPTIMIZATION TRUE)
@@ -88,7 +90,7 @@ endif()
 add_custom_target(run
         COMMAND ${CMAKE_BINARY_DIR}/bin/master 30 3 50
         WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
-        DEPENDS master registration triage doctor patient
+        DEPENDS master registration triage doctor patient dispatcher
         COMMENT "Running Project ER simulation"
 )
 
