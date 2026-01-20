@@ -4,8 +4,14 @@ project(SO_Project LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 26)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-if (NOT UNIX OR APPLE)
-    message(FATAL_ERROR "This project must be built on Linux (POSIX IPC required).")
+option(DEV "Allow configuring on non-Linux (Windows)" OFF)
+
+if(NOT DEV)
+    if (NOT UNIX OR APPLE)
+        message(FATAL_ERROR "This project must be built on Linux (POSIX IPC required).")
+    endif()
+else()
+    message(WARNING "DEV=ON: Configuring on non-Linux host. POSIX IPC targets and ipc-clean target will be skipped or be no-op.")
 endif()
 
 if (NOT CMAKE_BUILD_TYPE)
@@ -36,8 +42,12 @@ else()
     message(STATUS "Unknown compiler: using default flags")
 endif()
 
-# POSIX libraries
-set(POSIX_LIBS pthread rt)
+# POSIX libraries only on UNIX systems
+if (UNIX)
+    set(POSIX_LIBS pthread rt)
+else()
+    set(POSIX_LIBS "")
+endif()
 
 # Project includes
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})
@@ -49,13 +59,15 @@ add_executable(doctor src/doctor.cpp)
 add_executable(patient src/patient.cpp)
 add_executable(dispatcher src/dispatcher.cpp)
 
-# Link POSIX libs
-target_link_libraries(master PRIVATE ${POSIX_LIBS})
-target_link_libraries(registration PRIVATE ${POSIX_LIBS})
-target_link_libraries(triage PRIVATE ${POSIX_LIBS})
-target_link_libraries(doctor PRIVATE ${POSIX_LIBS})
-target_link_libraries(patient PRIVATE ${POSIX_LIBS})
-target_link_libraries(dispatcher PRIVATE ${POSIX_LIBS})
+# Link POSIX libs only on UNIX
+if (UNIX)
+    target_link_libraries(master PRIVATE ${POSIX_LIBS})
+    target_link_libraries(registration PRIVATE ${POSIX_LIBS})
+    target_link_libraries(triage PRIVATE ${POSIX_LIBS})
+    target_link_libraries(doctor PRIVATE ${POSIX_LIBS})
+    target_link_libraries(patient PRIVATE ${POSIX_LIBS})
+    target_link_libraries(dispatcher PRIVATE ${POSIX_LIBS})
+endif()
 
 # Set runtime output dir
 set_target_properties(
@@ -94,8 +106,14 @@ add_custom_target(run
         COMMENT "Running Project ER simulation"
 )
 
-add_custom_target(clean-ipc
-        COMMAND rm -f /dev/mqueue/er_* || true
-        COMMAND rm -f /dev/shm/er_* || true
-        COMMENT "Cleaning POSIX message queues and shared memory"
-)
+if (UNIX)
+    add_custom_target(clean-ipc
+            COMMAND rm -f /dev/mqueue/er_* || true
+            COMMAND rm -f /dev/shm/er_* || true
+            COMMENT "Cleaning POSIX message queues and shared memory"
+    )
+else()
+    add_custom_target(clean-ipc
+            COMMENT "clean-ipc: no-op on non-Unix hosts (DEV may be active)"
+    )
+endif()
