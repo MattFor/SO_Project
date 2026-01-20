@@ -84,19 +84,13 @@ int main(const int argc, char** argv)
         return 1;
     }
 
-g_shm = static_cast<ERShared*>(
-    mmap(nullptr, sizeof(ERShared),
-         PROT_READ | PROT_WRITE,
-         MAP_SHARED,
-         g_shm_fd,
-         0));
+    g_shm = static_cast<ERShared*>(mmap(nullptr, sizeof(ERShared), PROT_READ | PROT_WRITE, MAP_SHARED, g_shm_fd, 0));
 
-if (g_shm == MAP_FAILED)
-{
-    perror("mmap reg");
-    return 1;
-}
-
+    if (g_shm == MAP_FAILED)
+    {
+        perror("mmap reg");
+        return 1;
+    }
 
     g_shm_sem = sem_open(SEM_SHM_NAME, 0);
     if (g_shm_sem == SEM_FAILED)
@@ -183,36 +177,26 @@ if (g_shm == MAP_FAILED)
                 cm.cmd        = CTRL_INSIDE;
                 cm.target_pid = p.pid;
 
-                const mqd_t mq_ctrl =
-                    mq_open(MQ_PATIENT_CTRL, O_WRONLY | O_CLOEXEC);
+                const mqd_t mq_ctrl = mq_open(MQ_PATIENT_CTRL, O_WRONLY | O_CLOEXEC);
 
                 if (mq_ctrl != (mqd_t)-1)
                 {
-                    if (mq_send(
-                            mq_ctrl,
-                            reinterpret_cast<const char*>(&cm),
-                            sizeof(cm),
-                            0) == -1)
+                    if (mq_send(mq_ctrl, reinterpret_cast<const char*>(&cm), sizeof( cm ), 0) == -1)
                     {
-                        log_reg("Failed to send CTRL_INSIDE to pid=" +
-                                std::to_string(p.pid) +
-                                " errno=" + std::to_string(errno));
+                        log_reg("Failed to send CTRL_INSIDE to pid=" + std::to_string(p.pid) + " errno=" + std::to_string(errno));
                     }
                     else
                     {
-                        log_reg("Sent CTRL_INSIDE to pid=" +
-                                std::to_string(p.pid));
+                        log_reg("Sent CTRL_INSIDE to pid=" + std::to_string(p.pid));
                     }
 
                     mq_close(mq_ctrl);
                 }
                 else
                 {
-                    log_reg("Failed to open MQ_PATIENT_CTRL errno=" +
-                            std::to_string(errno));
+                    log_reg("Failed to open MQ_PATIENT_CTRL errno=" + std::to_string(errno));
                 }
             }
-
         }
         else
         {

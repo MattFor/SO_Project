@@ -108,15 +108,10 @@ inline std::string timestamp()
     return std::string(final_buf);
 }
 
-
-// --- add after ERShared in Utilities.h ---
-
 // Control registry: fixed size array of slots (one per potential patient).
 // Registry size should be >= max concurrent live patients (choose 131072 or similar).
-static constexpr size_t CTRL_REGISTRY_SIZE = 131072; // tune as needed
-static constexpr size_t CTRL_SEM_BUCKETS    = 256;   // small, power-of-two preferred
-
-// in Utilities.h
+static constexpr size_t CTRL_REGISTRY_SIZE = 262144;//131072; // tune as needed
+static constexpr size_t CTRL_SEM_BUCKETS    = 1024;   // small, power-of-two preferred
 
 struct ControlSlot
 {
