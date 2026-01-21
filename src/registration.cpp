@@ -162,7 +162,6 @@ int main(const int argc, char** argv)
 
         PatientInfo p{};
         memcpy(&p, buf, sizeof(PatientInfo));
-        // Update shared memory counts
         if (sem_wait(g_shm_sem) == -1)
         {
             perror("sem_wait reg2");

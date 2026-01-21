@@ -14,6 +14,14 @@
 
 #include "../include/Utilities.h"
 
+// shared control attachments
+static int              shm_fd   = -1;
+static size_t           shm_size = 0;
+
+static sem_t*           shm_sem  = nullptr;
+static ERShared*        ctrl     = nullptr; // Real shared header struct
+static ControlRegistry* ctrl_reg = nullptr; // Control registry after ERShared
+
 static volatile sig_atomic_t evacuation       = 0;
 static volatile sig_atomic_t leave_after_next = 0;
 static FILE*                 doc_log          = nullptr;
@@ -45,13 +53,6 @@ static void log_doc(const std::string& s)
         fflush(doc_log);
     }
 }
-
-// shared control attachments
-static sem_t*           shm_sem  = nullptr;
-static ERShared*        ctrl     = nullptr; // Real shared header struct
-static ControlRegistry* ctrl_reg = nullptr; // Control registry after ERShared
-static int              shm_fd   = -1;
-static size_t           shm_size = 0;
 
 // Attach shared memory: map ERShared followed by ControlRegistry
 static bool attach_shared_control()
@@ -121,6 +122,54 @@ static void detach_shared_control()
     }
 }
 
+static void handle_child_treated(const PatientInfo& p, int doc_id)
+{
+    // Account child as treated in shared memory under semaphore protection
+    if (shm_sem && ctrl)
+    {
+        if (sem_wait(shm_sem) == -1)
+        {
+            perror("sem_wait (doctor account child)");
+        }
+        else
+        {
+            ++ctrl->total_treated;
+            log_doc("Doctor " + std::to_string(doc_id) + " incremented total_treated -> " + std::to_string(ctrl->total_treated) + " for child id=" + std::to_string(p.id));
+            if (sem_post(shm_sem) == -1)
+            {
+                perror("sem_post (doctor account child)");
+            }
+        }
+    }
+
+    // Notify parent if we have a pid so that parent can clean up current_inside and bookkeeping.
+    if (p.pid > 0)
+    {
+        ControlMessage cm{};
+        cm.cmd        = CTRL_CHILD_TREATED;
+        cm.target_pid = p.pid;
+        cm.target_id  = p.id;
+        cm.priority   = 0;
+
+        const mqd_t mq_ctrl = mq_open(MQ_PATIENT_CTRL, O_WRONLY | O_CLOEXEC);
+        if (mq_ctrl != (mqd_t)-1)
+        {
+            if (mq_send(mq_ctrl, reinterpret_cast<const char*>(&cm), sizeof(cm), 0) == -1)
+            {
+                log_doc("Failed to notify parent pid=" + std::to_string(p.pid) + " of child treated id=" + std::to_string(p.id) + " errno=" + std::to_string(errno));
+            }
+            else
+            {
+                log_doc("Notified parent pid=" + std::to_string(p.pid) + " of child treated id=" + std::to_string(p.id));
+            }
+            mq_close(mq_ctrl);
+        }
+        else
+        {
+            log_doc("mq_open(MQ_PATIENT_CTRL) failed when notifying parent for child id=" + std::to_string(p.id) + " errno=" + std::to_string(errno));
+        }
+    }
+}
 
 int main(const int argc, char** argv)
 {
@@ -161,7 +210,7 @@ int main(const int argc, char** argv)
     }
 
     const mqd_t mq_doc = mq_open(MQ_DOCTOR_NAME, O_RDONLY);
-    if (mq_doc == (mqd_t)-1)
+    if (mq_doc == ( mqd_t ) - 1)
     {
         perror("mq_open doctor read");
         detach_shared_control();
@@ -174,7 +223,6 @@ int main(const int argc, char** argv)
     char         buf[MAX_MSG_SIZE];
     unsigned int prio;
 
-    // announce online
     if (shm_sem && ctrl)
     {
         if (sem_wait(shm_sem) == -1)
@@ -183,7 +231,7 @@ int main(const int argc, char** argv)
         }
         else
         {
-            ctrl->doctors_online++;
+            __atomic_fetch_add(&ctrl->doctors_online, 1, __ATOMIC_RELAXED);
             if (sem_post(shm_sem) == -1)
             {
                 perror("sem_post");
@@ -215,30 +263,14 @@ int main(const int argc, char** argv)
         memcpy(&p, buf, sizeof(PatientInfo));
         log_doc("Doctor " + std::to_string(doc_id) + " started treating patient id=" + std::to_string(p.id));
         // Simulate treatment time
-        const int treat_ms = rng() % 800 + 200;
-        usleep(treat_ms);
+        // const int treat_ms = rng() % 800 + 1;
+        // usleep(treat_ms);
 
         if (p.age < 18)
         {
-            if (shm_sem && ctrl)
-            {
-                if (sem_wait(shm_sem) == -1)
-                {
-                    perror("sem_wait (doctor account child)");
-                }
-                else
-                {
-                    ++ctrl->total_treated;
-                    if (sem_post(shm_sem) == -1)
-                    {
-                        perror("sem_post (doctor account child)");
-                    }
-                }
-            }
-
-            log_doc("Doctor treated child id=" + std::to_string(p.id) + " (no signal to parent)");
-
-            continue; // go to next patient
+            handle_child_treated(p, doc_id);
+            log_doc("Doctor treated child id=" + std::to_string(p.id) + " (notified parent)");
+            continue;
         }
 
         // Aftercare probabilities

@@ -10,11 +10,12 @@
 #include <ctime>
 #include <string>
 #include <cstdio>
-#include <mqueue.h>
-#include <sys/mman.h>
 #include <atomic>
+#include <mqueue.h>
 #include <sys/wait.h>
+#include <sys/mman.h>
 #include <semaphore.h>
+#include <condition_variable>
 
 #define LOGGING 0
 
@@ -32,11 +33,12 @@ static constexpr auto MQ_PATIENT_CTRL = "/er_patient_ctrl";
 // Control commands for per-patient control MQ
 enum CtrlCmd : int
 {
+    CTRL_CHILD_TREATED,
     CTRL_SPAWN_CHILD,
+    CTRL_GOTO_DOCTOR,
     CTRL_SHUTDOWN,
     CTRL_DISMISS,
     CTRL_INSIDE,
-    CTRL_GOTO_DOCTOR
 };
 
 struct ControlMessage

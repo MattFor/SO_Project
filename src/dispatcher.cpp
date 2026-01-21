@@ -14,8 +14,8 @@
 
 #include "../include/Utilities.h"
 
-static ControlRegistry* g_ctrl_reg     = nullptr;
 static int              g_shm_fd       = -1;
+static ControlRegistry* g_ctrl_reg     = nullptr;
 static FILE*            dispatcher_log = nullptr;
 
 static void log_dispatcher(const std::string& s)
@@ -27,7 +27,6 @@ static void log_dispatcher(const std::string& s)
 
     if (!dispatcher_log)
     {
-        // attempt to open lazily if not yet opened
         if (const int dfd = open("../../logs/dispatcher.log", O_CREAT | O_WRONLY | O_APPEND, IPC_MODE); dfd != -1)
         {
             dispatcher_log = fdopen(dfd, "a");
@@ -72,7 +71,6 @@ static bool open_shm_registry()
         return false;
     }
 
-    // We assume ERShared is placed at start of SHM, immediately followed by ControlRegistry.
     g_ctrl_reg = reinterpret_cast<ControlRegistry*>(static_cast<char*>(p) + sizeof(ERShared));
 
     if (dispatcher_log)
@@ -83,7 +81,6 @@ static bool open_shm_registry()
     return true;
 }
 
-// small helper: find slot by pid
 static ssize_t find_slot_for_pid(pid_t pid)
 {
     for (size_t i = 0; i < CTRL_REGISTRY_SIZE; ++i)
@@ -144,7 +141,7 @@ int main()
 
     while (true)
     {
-        const ssize_t r = mq_receive(mq_ctrl, buf, sizeof( buf ), &prio);
+        const ssize_t r = mq_receive(mq_ctrl, buf, sizeof(buf), &prio);
         if (r == -1)
         {
             if (errno == EINTR)
@@ -158,23 +155,20 @@ int main()
 
         if (r < static_cast<ssize_t>(sizeof(ControlMessage)))
         {
-            // malformed message
             log_dispatcher("mq_receive: short/malformed message ignored");
             continue;
         }
 
         ControlMessage cm{};
-        memcpy(&cm, buf, sizeof( cm ));
+        memcpy(&cm, buf, sizeof(cm));
 
         if (cm.target_pid == 0)
         {
-            // broadcast? not used currently
             log_dispatcher("mq_receive: msg with target_pid==0 (broadcast) ignored");
             continue;
         }
 
-        const ssize_t slot_idx = find_slot_for_pid(cm.target_pid);
-        if (slot_idx >= 0)
+        if (const ssize_t slot_idx = find_slot_for_pid(cm.target_pid); slot_idx >= 0)
         {
             ControlSlot& slot = g_ctrl_reg->slots[slot_idx];
 
@@ -184,7 +178,6 @@ int main()
             std::atomic_thread_fence(std::memory_order_release);
             slot.seq.store(nextseq ? nextseq : 1, std::memory_order_release);
 
-            // sem_post the bucket
             const size_t      bucket = slot_to_bucket(static_cast<size_t>(slot_idx));
             const std::string sname  = ctrl_sem_name(bucket);
             if (sem_t* sem = sem_open(sname.c_str(), 0); sem != SEM_FAILED)
@@ -192,7 +185,6 @@ int main()
                 if (sem_post(sem) == -1)
                 {
                     log_dispatcher(std::string("sem_post failed for ") + sname + " errno=" + std::to_string(errno));
-                    // still close
                 }
                 else
                 {
@@ -202,14 +194,11 @@ int main()
             }
             else
             {
-                // If sem_open fails, message is still in slot; patient polls occasionally.
                 log_dispatcher(std::string("sem_open failed for ") + sname + " errno=" + std::to_string(errno));
-                // keep going
             }
         }
         else
         {
-            // No slot found for pid. Log and continue.
             log_dispatcher(std::string("No slot found for pid=") + std::to_string(cm.target_pid) + " — dropping message");
         }
     }
@@ -222,6 +211,4 @@ int main()
         fclose(dispatcher_log);
         dispatcher_log = nullptr;
     }
-
-    return 0;
 }

@@ -17,6 +17,14 @@
 
 static FILE* triage_log = nullptr;
 
+static size_t           shm_size = 0;
+static int              shm_fd   = -1;
+
+static sem_t*           shm_sem  = nullptr;
+static ERShared*        ctrl     = nullptr;
+static ControlRegistry* ctrl_reg = nullptr;
+
+
 static void log_tri(const std::string& s)
 {
     if constexpr (!LOGGING)
@@ -26,23 +34,15 @@ static void log_tri(const std::string& s)
 
     if (triage_log)
     {
-        std::string t = timestamp() + " " + s + "\n";
+        const std::string t = timestamp() + " " + s + "\n";
         fwrite(t.c_str(), 1, t.size(), triage_log);
         fflush(triage_log);
     }
 }
 
-// --- shared control attachments (put near top of file, after includes) ----------
-static sem_t*           shm_sem  = nullptr;
-static ERShared*        ctrl     = nullptr; // real shared header struct
-static ControlRegistry* ctrl_reg = nullptr; // control registry after ERShared
-static int              shm_fd   = -1;
-static size_t           shm_size = 0;
-
 // Attach shared memory: map ERShared followed by ControlRegistry
 static bool attach_shared_control()
 {
-    // open existing shared memory region (created by master)
     shm_fd = shm_open(SHM_NAME, O_RDWR, 0);
     if (shm_fd == -1)
     {
@@ -50,10 +50,8 @@ static bool attach_shared_control()
         return false;
     }
 
-    // calculate expected size: ERShared + ControlRegistry
     shm_size = sizeof(ERShared) + sizeof(ControlRegistry);
 
-    // map the entire region
     void* ptr = mmap(nullptr, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
     if (ptr == MAP_FAILED)
     {
@@ -63,11 +61,9 @@ static bool attach_shared_control()
         return false;
     }
 
-    // set pointers: ERShared at base, ControlRegistry immediately after
     ctrl     = static_cast<ERShared*>(ptr);
     ctrl_reg = reinterpret_cast<ControlRegistry*>(static_cast<char*>(ptr) + sizeof(ERShared));
 
-    // open the named semaphore created by master
     shm_sem = sem_open(SEM_SHM_NAME, 0);
     if (shm_sem == SEM_FAILED)
     {
@@ -138,12 +134,11 @@ int main()
     while (true)
     {
         sem_wait(shm_sem);
-        const int docs = ctrl->doctors_online;
+        const int docs = __atomic_load_n(&ctrl->doctors_online, __ATOMIC_RELAXED);
         sem_post(shm_sem);
 
         if (docs == 0)
         {
-            // avoid busy-spin when no doctors: small sleep
             usleep(5 * 1000);
             continue;
         }
@@ -151,7 +146,6 @@ int main()
         // Now try to receive a triage message (non-blocking)
         unsigned int  prio = 0;
         const ssize_t r    = mq_receive(mq_triage, buf, MAX_MSG_SIZE, &prio);
-
 
         if (r == -1)
         {
@@ -199,8 +193,7 @@ int main()
         }
 
         unsigned int send_prio;
-        const double c = uni(rng);
-        if (c < 0.10)
+        if (const double c = uni(rng); c < 0.10)
         {
             send_prio = 8;
         }
@@ -219,7 +212,6 @@ int main()
         cm.target_id  = p.id;
         cm.priority   = send_prio;
 
-        // 🔑 OPEN SHARED CONTROL MQ PER SEND (DO NOT CACHE)
         const mqd_t mq_ctrl = mq_open(MQ_PATIENT_CTRL, O_WRONLY | O_CLOEXEC);
 
         if (mq_ctrl == (mqd_t)-1)
@@ -244,5 +236,4 @@ int main()
 
     mq_close(mq_triage);
     fclose(triage_log);
-    return 0;
 }

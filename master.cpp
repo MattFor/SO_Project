@@ -25,6 +25,8 @@
 
 #include "include/Utilities.h"
 
+static constexpr int ADULTS_ONLY = 0; // 0 or 100
+
 static ERShared* g_shm        = nullptr;
 static int       g_shm_fd     = -1;
 static sem_t*    g_shm_sem    = nullptr;
@@ -40,8 +42,8 @@ static std::atomic_bool g_ipc_lost{false};        // Set by check_ipc_presence()
 static std::atomic_bool g_signal_received{false}; // Set by real signal handler
 static std::atomic_int  g_signal_number{0};       // Which signal was seen
 
-static constexpr int   MAX_CONCURRENT_PROCESSES = 33333;
-static std::atomic_int g_current_processes{1}; // count master itself at start
+static constexpr int   MAX_CONCURRENT_PROCESSES = 20000;
+static std::atomic_int g_current_processes{1};
 
 static ControlRegistry* g_ctrl_reg = nullptr;
 
@@ -71,11 +73,17 @@ static bool is_pid_alive(const pid_t pid)
     return pid > 0 && ( kill(pid, 0) == 0 || errno == EPERM );
 }
 
-// Async signal safe handler, only sets atomics
 static void shutdown_signal_handler(const int signum)
 {
-    g_signal_number.store(signum);
+    g_signal_number.store(signum, std::memory_order_relaxed);
     g_signal_received.store(true);
+
+    g_shutdown_requested.store(true);
+
+    if (g_shm_sem && g_shm_sem != SEM_FAILED)
+    {
+        sem_post(g_shm_sem);
+    }
 }
 
 static std::string strip_leading_slash(const char* name)
@@ -172,7 +180,7 @@ static bool check_ipc_presence_and_report()
 static int mq_curmsgs_safe(const char* name)
 {
     const mqd_t mq = mq_open(name, O_RDONLY);
-    if (mq == (mqd_t)-1)
+    if (mq == ( mqd_t ) - 1)
     {
         return -1;
     }
@@ -251,21 +259,16 @@ static void terminate_service_graceful(pid_t& pid, const std::string& name)
     pid = -1;
 }
 
-// Gracefully terminate and reap all tracked adult patient PIDs.
-// - Sends SIGTERM to each patient, staggered with a short sleep.
-// - Waits a short grace period for them to exit.
-// - Calls terminate_service_graceful on any survivors to force-kill and reap.
 static void terminate_patients_graceful(std::vector<pid_t>& adult_patient_pids)
 {
     std::vector<pid_t> pids_to_handle;
     {
         std::lock_guard lk(g_patient_mutex);
-        // remove dead PIDs first
         std::erase_if(adult_patient_pids, [](const pid_t p)
         {
             return !is_pid_alive(p);
         });
-        pids_to_handle = adult_patient_pids; // copy snapshot
+        pids_to_handle = adult_patient_pids;
     }
 
     if (pids_to_handle.empty())
@@ -274,55 +277,150 @@ static void terminate_patients_graceful(std::vector<pid_t>& adult_patient_pids)
         return;
     }
 
-    log_master("terminate_patients_graceful: sending SIGTERM to " + std::to_string(pids_to_handle.size()) + " patients (staggered)");
+    const size_t n = pids_to_handle.size();
+    log_master("terminate_patients_graceful: will handle " + std::to_string(n) + " patients using parallel workers");
 
-    // Send SIGTERM to all patients with a small stagger to avoid spamming the kernel
-    for (const pid_t p : pids_to_handle)
+    const unsigned hc          = std::thread::hardware_concurrency();
+    const size_t   max_workers = std::max<size_t>(1, hc ? hc : 4);
+    const size_t   workers     = std::min(max_workers, n);
+
     {
-        if (p <= 0)
-            continue;
-        if (!is_pid_alive(p))
-            continue;
+        std::atomic_size_t       idx{0};
+        std::vector<std::thread> pool;
+        pool.reserve(workers);
 
-        if (kill(p, SIGTERM) == -1)
+        log_master("terminate_patients_graceful: phase1 - sending SIGUSR2 with " + std::to_string(workers) + " workers");
+
+        for (size_t w = 0; w < workers; ++w)
         {
-            // Not fatal; log and continue
-            log_master(std::string("terminate_patients_graceful: failed to send SIGTERM to pid=") + std::to_string(p) + " errno=" + std::to_string(errno));
+            pool.emplace_back([&]()
+            {
+                while (true)
+                {
+                    const size_t i = idx.fetch_add(1, std::memory_order_relaxed);
+                    if (i >= n)
+                    {
+                        break;
+                    }
+
+                    const pid_t p = pids_to_handle[i];
+                    if (p <= 0)
+                    {
+                        continue;
+                    }
+
+                    if (!is_pid_alive(p))
+                    {
+                        log_master(std::string("terminate_patients_graceful: phase1 pid=") + std::to_string(p) + " already dead");
+                        continue;
+                    }
+
+                    if (kill(p, SIGUSR2) == -1)
+                    {
+                        log_master(std::string("terminate_patients_graceful: phase1 failed to send SIGUSR2 to pid=") + std::to_string(p) + " errno=" + std::to_string(errno));
+                    }
+                    else
+                    {
+                        log_master(std::string("terminate_patients_graceful: phase1 sent SIGUSR2 to pid=") + std::to_string(p));
+                    }
+                }
+            });
+        }
+
+        for (auto& t : pool)
+        {
+            if (t.joinable())
+            {
+                t.join();
+            }
+        }
+    }
+
+    // Short grace period
+    constexpr auto grace_ms = 200;
+    std::this_thread::sleep_for(std::chrono::milliseconds(grace_ms));
+
+    {
+        std::vector<pid_t> survivors;
+        survivors.reserve(n);
+        for (const pid_t p : pids_to_handle)
+        {
+            if (p <= 0)
+            {
+                continue;
+            }
+
+            if (is_pid_alive(p))
+            {
+                survivors.push_back(p);
+            }
+            else
+            {
+                log_master(std::string("terminate_patients_graceful: pid=") + std::to_string(p) + " exited after SIGUSR2");
+            }
+        }
+
+        if (!survivors.empty())
+        {
+            const size_t             m = survivors.size();
+            std::atomic_size_t       idx{0};
+            std::vector<std::thread> pool;
+            pool.reserve(std::min(workers, m));
+
+            log_master("terminate_patients_graceful: phase2 - ensuring termination of " + std::to_string(m) + " survivors with " + std::to_string(std::min(workers, m)) + " workers");
+
+            for (size_t w = 0; w < std::min(workers, m); ++w)
+            {
+                pool.emplace_back([&]()
+                {
+                    while (true)
+                    {
+                        const size_t i = idx.fetch_add(1, std::memory_order_relaxed);
+                        if (i >= m)
+                        {
+                            break;
+                        }
+
+                        const pid_t p = survivors[i];
+                        if (p <= 0)
+                        {
+                            continue;
+                        }
+
+                        if (!is_pid_alive(p))
+                        {
+                            log_master(std::string("terminate_patients_graceful: phase2 pid=") + std::to_string(p) + " already exited");
+                            continue;
+                        }
+
+                        pid_t local = p;
+                        terminate_service_graceful(local, "patient");
+                        if (!is_pid_alive(p))
+                        {
+                            log_master(std::string("terminate_patients_graceful: phase2 ensured termination of pid=") + std::to_string(p));
+                        }
+                        else
+                        {
+                            log_master(std::string("terminate_patients_graceful: phase2 still alive after terminate_service_graceful pid=") + std::to_string(p));
+                        }
+                    }
+                });
+            }
+
+            for (auto& t : pool)
+            {
+                if (t.joinable())
+                {
+                    t.join();
+                }
+            }
         }
         else
         {
-            log_master(std::string("terminate_patients_graceful: sent SIGTERM to pid=") + std::to_string(p));
+            log_master("terminate_patients_graceful: phase2 - no survivors to handle");
         }
-
-        // stagger slightly so the kernel and child processes don't all wake at once
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
-    // Grace period: give them a moment to exit cleanly.
-    constexpr auto grace_ms = 500;
-    std::this_thread::sleep_for(std::chrono::milliseconds(grace_ms));
-
-    // Now force-kill / reap any survivors using existing helper (which also waits and reaps).
-    for (pid_t p : pids_to_handle)
-    {
-        if (p <= 0)
-        {
-            continue;
-        }
-
-        if (!is_pid_alive(p))
-        {
-            log_master(std::string("terminate_patients_graceful: pid=") + std::to_string(p) + " already exited");
-            continue;
-        }
-
-        // terminate_service_graceful will send SIGTERM then SIGKILL if needed and reap the pid.
-        pid_t local = p;
-        terminate_service_graceful(local, "patient");
-        log_master(std::string("terminate_patients_graceful: ensured termination of pid=") + std::to_string(p));
-    }
-
-    // Clean up master list
     {
         std::lock_guard lk(g_patient_mutex);
         for (pid_t p : pids_to_handle)
@@ -333,7 +431,6 @@ static void terminate_patients_graceful(std::vector<pid_t>& adult_patient_pids)
 
     log_master("terminate_patients_graceful: finished");
 }
-
 
 static void truncate_log_file(const std::string& path)
 {
@@ -434,25 +531,17 @@ static void cleanup()
     log_master("cleanup: finished cleanup()");
 }
 
-
-// SIGUSR2 => set evacuation flag in shared memory
 static void sigusr2_handler(int)
 {
-    if (g_shm && g_shm_sem)
+    g_signal_number.store(SIGUSR2, std::memory_order_relaxed);
+    g_signal_received.store(true);
+
+    g_shutdown_requested.store(true);
+
+    if (g_shm_sem && g_shm_sem != SEM_FAILED)
     {
-        if (sem_wait(g_shm_sem) == -1)
-        {
-            perror("sem_wait");
-        }
-
-        g_shm->evacuation = true;
-        if (sem_post(g_shm_sem) == -1)
-        {
-            perror("sem_post");
-        }
+        sem_post(g_shm_sem);
     }
-
-    log_master("SIGUSR2 received by master: evacuation flag set in shared memory.");
 }
 
 // Spawn process helper (fork + exec)
@@ -492,32 +581,27 @@ static pid_t spawn_process_limited(const std::string& path, const std::vector<st
 {
     while (!g_shutdown_requested.load())
     {
-        constexpr int backoff_ms = 500;
+        constexpr int backoff_ms = 10 * 1000;
         const int     cur        = g_current_processes.load(std::memory_order_relaxed);
 
-        // If at/over limit -> wait a bit
         if (cur >= MAX_CONCURRENT_PROCESSES)
         {
             std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
             continue;
         }
 
-        // Try to claim one slot
-        int expected = cur;
-        if (g_current_processes.compare_exchange_strong(expected, cur + 1))
+        if (int expected = cur; g_current_processes.compare_exchange_strong(expected, cur + 1))
         {
-            // We claimed a slot. Attempt spawn.
-            pid_t pid = spawn_process(path, args);
+            const pid_t pid = spawn_process(path, args);
             if (pid <= 0)
             {
-                // spawn failed, release claimed slot
                 g_current_processes.fetch_sub(1);
                 return -1;
             }
+
             return pid;
         }
 
-        // CAS failed -> retry after short sleep
         std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
     }
 
@@ -537,7 +621,7 @@ static bool setup_ipc()
     attr.mq_curmsgs = 0;
 
     mqd_t mqd = mq_open(MQ_REG_NAME, O_CREAT | O_RDWR, IPC_MODE, &attr);
-    if (mqd == (mqd_t)-1)
+    if (mqd == ( mqd_t ) - 1)
     {
         perror("mq_open reg");
         log_master(std::string("setup_ipc: mq_open reg failed: ") + strerror(errno));
@@ -547,7 +631,7 @@ static bool setup_ipc()
     log_master("setup_ipc: registration MQ created/validated");
 
     mqd = mq_open(MQ_TRIAGE_NAME, O_CREAT | O_RDWR, IPC_MODE, &attr);
-    if (mqd == (mqd_t)-1)
+    if (mqd == ( mqd_t ) - 1)
     {
         perror("mq_open triage");
         log_master(std::string("setup_ipc: mq_open triage failed: ") + strerror(errno));
@@ -557,7 +641,7 @@ static bool setup_ipc()
     log_master("setup_ipc: triage MQ created/validated");
 
     mqd = mq_open(MQ_DOCTOR_NAME, O_CREAT | O_RDWR, IPC_MODE, &attr);
-    if (mqd == (mqd_t)-1)
+    if (mqd == ( mqd_t ) - 1)
     {
         perror("mq_open doctor");
         log_master(std::string("setup_ipc: mq_open doctor failed: ") + strerror(errno));
@@ -574,7 +658,7 @@ static bool setup_ipc()
 
     mqd = mq_open(MQ_PATIENT_CTRL, O_CREAT | O_RDWR | O_CLOEXEC, IPC_MODE, &ctrl_attr);
 
-    if (mqd == (mqd_t)-1)
+    if (mqd == ( mqd_t ) - 1)
     {
         perror("mq_open patient_ctrl");
         log_master(std::string("setup_ipc: mq_open patient_ctrl failed: ") + strerror(errno));
@@ -690,7 +774,7 @@ static bool send_spawn_child_to_patient(const pid_t target_pid, ControlMessage c
 
     const mqd_t mq = mq_open(MQ_PATIENT_CTRL, O_WRONLY | O_CLOEXEC);
 
-    if (mq == (mqd_t)-1)
+    if (mq == ( mqd_t ) - 1)
     {
         log_master("send_spawn_child_to_patient: mq_open(MQ_PATIENT_CTRL) failed: " + std::string(strerror(errno)));
         return false;
@@ -750,6 +834,12 @@ static void input_thread_fn(std::atomic_bool& stop_flag, pid_t& reg1_pid, pid_t&
 {
     int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
     fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
+
+    if (setpriority(PRIO_PROCESS, 0, -20) == -1)
+    {
+        perror("setpriority");
+        log_master("input_thread/add: failed to increase priority");
+    }
 
     log_master("input_thread: started");
     std::default_random_engine rng(static_cast<unsigned>(time(nullptr)) ^ pthread_self());
@@ -1362,7 +1452,6 @@ static void input_thread_fn(std::atomic_bool& stop_flag, pid_t& reg1_pid, pid_t&
                         sem_post(g_shm_sem);
                     }
 
-                    // signal_all_services(reg1_pid, reg2_pid, triage_pid, doctor_pids);
                     log_master("input_thread: interactive shutdown requested");
 
                     // Drain any remaining stdin so duplicate text won't be re-processed
@@ -1376,7 +1465,7 @@ static void input_thread_fn(std::atomic_bool& stop_flag, pid_t& reg1_pid, pid_t&
                     std::cout << "Shutdown already requested\n";
                 }
 
-                stop_flag = true; // Tell caller thread we're done
+                stop_flag = true;
                 log_master("input_thread: exiting after shutdown request");
                 return;
             }
@@ -1538,7 +1627,7 @@ int main(int argc, char** argv)
 
         for (int i = 0; i < num_patients && !g_shutdown_requested.load(); i++)
         {
-            int  age      = rng() % 80 + 100;
+            int  age      = rng() % 80 + 1 + ADULTS_ONLY;
             bool is_child = age < 18;
             bool is_vip   = rng() % 100 < 5;
 
@@ -1610,8 +1699,6 @@ int main(int argc, char** argv)
                     log_master(out.str());
                 }
             }
-
-            // std::this_thread::sleep_for(std::chrono::microseconds(50));
         }
 
         spawn_done.store(true);
@@ -1688,10 +1775,6 @@ int main(int argc, char** argv)
                         perror("sem_post");
                     }
                 }
-
-                // Broadcast to services
-                // signal_all_services(reg1_pid, reg2_pid, triage_pid, doctor_pids);
-                // Set g_shutdown_requested already done by compare_exchange above
             }
         }
 
@@ -1776,30 +1859,6 @@ int main(int argc, char** argv)
         }
 
         {
-            std::lock_guard lk(g_patient_mutex);
-
-            // Iterate backwards so we can remove items efficiently
-            for (int i = pending_children.size() - 1; i >= 0; --i)
-            {
-                if (adult_patient_pids.empty())
-                    break; // Still no adults
-
-                // Pick a random adult or the last one
-                pid_t adult_pid = adult_patient_pids.back();
-
-                // Send the child to this adult
-                ControlMessage& cm = pending_children[i];
-
-                // ... (Logic to send CTRL_SPAWN_CHILD to adult_pid via ControlRegistry) ...
-                // You will need to map the pid to a control slot here.
-
-                // If successful:
-                pending_children.erase(pending_children.begin() + i);
-                std::cout << "Re-assigned pending child to adult " << adult_pid << "\n";
-            }
-        }
-
-        {
             int   status;
             pid_t w;
             while (( w = waitpid(-1, &status, WNOHANG) ) > 0)
@@ -1838,12 +1897,9 @@ int main(int argc, char** argv)
                     }
                 }
 
-                // After handling the reaped pid (w), decrement global active-process counter
                 {
-                    int prev = g_current_processes.fetch_sub(1);
-                    if (prev <= 0)
+                    if (int prev = g_current_processes.fetch_sub(1); prev <= 0)
                     {
-                        // guard against underflow (someone else may not have incremented)
                         g_current_processes.fetch_add(1);
                     }
                 }
@@ -1897,7 +1953,7 @@ int main(int argc, char** argv)
                     }
                     else
                     {
-                        ++it;
+                        it++;
                     }
                 }
             }
@@ -1969,3 +2025,4 @@ int main(int argc, char** argv)
 
     cleanup();
     g_shutdown_requested = true;
+}

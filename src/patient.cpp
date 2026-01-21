@@ -32,7 +32,7 @@ static sem_t*                   g_ctrl_sem = SEM_FAILED;
 static std::vector<PatientInfo> g_active_children;
 static std::mutex               g_children_mutex;
 // Registration MQ reused for this process
-static mqd_t g_reg_mq = (mqd_t)-1;
+static mqd_t g_reg_mq = ( mqd_t ) - 1;
 
 // Local copies of shared memory handles (for child threads to increment waiting_to_register)
 static int       g_shm_fd_local  = -1;
@@ -135,6 +135,7 @@ static void log_patient_local(const std::string& s)
 
 static void commit_patient_exit()
 {
+    // Ensure we only account once per process
     if (bool expected = false; !g_accounted.compare_exchange_strong(expected, true))
     {
         return;
@@ -142,30 +143,33 @@ static void commit_patient_exit()
 
     if (!should_count_as_processed())
     {
+        log_patient_local("commit_patient_exit: not counted as processed (reason=" + std::to_string(g_exit_reason.load()) + ")");
         return;
     }
 
     if (!g_shm_local || !g_shm_sem_local)
     {
+        log_patient_local("commit_patient_exit: no shm/sem local handles");
         return;
     }
 
     if (sem_wait(g_shm_sem_local) == -1)
     {
+        perror("sem_wait (commit_patient_exit)");
         return;
     }
 
     ++g_shm_local->total_treated;
+    log_patient_local("commit_patient_exit: incremented total_treated -> " + std::to_string(g_shm_local->total_treated));
 
-    sem_post(g_shm_sem_local);
+    if (sem_post(g_shm_sem_local) == -1)
+    {
+        perror("sem_post (commit_patient_exit)");
+    }
 }
-
 
 static bool setup_control_registry()
 {
-    // Assume shm already mmapped by setup_shm_local; we need to set g_ctrl_reg pointer.
-    // We used the layout: ERShared at start, followed by ControlRegistry.
-    // Need to remap or compute pointer from g_shm_local (ERShared*)
     if (!g_shm_local)
     {
         return false;
@@ -177,8 +181,6 @@ static bool setup_control_registry()
         return false;
     }
 
-    // Try to claim a slot: look for an empty slot (pid==0).
-    // Use simple linear search starting from alloc_cursor to spread allocations.
     const uint32_t start = g_ctrl_reg->alloc_cursor.fetch_add(1) % CTRL_REGISTRY_SIZE;
     for (size_t i = 0; i < CTRL_REGISTRY_SIZE; ++i)
     {
@@ -188,17 +190,14 @@ static bool setup_control_registry()
         {
             g_ctrl_slot = static_cast<int>(idx);
 
-            // mark seq = 0 (empty)
             g_ctrl_reg->slots[idx].seq.store(0, std::memory_order_relaxed);
 
-            // ensure semaphore for bucket exists (create if necessary)
             const size_t      bucket = slot_to_bucket(idx);
             const std::string sname  = ctrl_sem_name(bucket);
             sem_t*            sem    = sem_open(sname.c_str(), O_CREAT, IPC_MODE, 0);
             if (sem == SEM_FAILED)
             {
                 perror("sem_open patient register");
-                // continue: patient can still poll
             }
             else
             {
@@ -208,11 +207,10 @@ static bool setup_control_registry()
             return true;
         }
     }
-    // failed to claim a slot
+
     return false;
 }
 
-// Try to raise RLIMIT_NOFILE
 static void try_raise_rlimit()
 {
     rlimit rl{};
@@ -245,31 +243,41 @@ void release_waiting_room_slot_once()
 
     if (!g_shm_local || !g_shm_sem_local)
     {
+        log_patient_local("release_waiting_room_slot_once: no shm/sem local handles");
         return;
     }
 
     if (sem_wait(g_shm_sem_local) == -1)
     {
+        // perror("sem_wait (release_waiting_room_slot_once)");
         return;
     }
 
-    // Batch decrement
-    int remaining = g_registered_count.exchange(0);
-    if (remaining > 0 && g_shm_local->current_inside > 0)
+    if (const int remaining = g_registered_count.exchange(0); remaining <= 0)
     {
-        int to_release              = std::min(remaining, static_cast<int>(g_shm_local->current_inside));
+        log_patient_local("release_waiting_room_slot_once: nothing to release (remaining=" + std::to_string(remaining) + ")");
+    }
+    else if (g_shm_local->current_inside <= 0)
+    {
+        log_patient_local("release_waiting_room_slot_once: current_inside already zero, cannot release (remaining=" + std::to_string(remaining) + ")");
+    }
+    else
+    {
+        const int to_release = std::min(remaining, static_cast<int>(g_shm_local->current_inside));
         g_shm_local->current_inside -= to_release;
-        log_patient_local("Released slots in batch: " + std::to_string(to_release));
+        log_patient_local("Released slots in batch: remaining=" + std::to_string(remaining) + " to_release=" + std::to_string(to_release) + " current_inside_now=" + std::to_string(g_shm_local->current_inside));
     }
 
-    sem_post(g_shm_sem_local);
+    if (sem_post(g_shm_sem_local) == -1)
+    {
+        perror("sem_post (release_waiting_room_slot_once)");
+    }
 }
-
 
 // Open registration MQ once (writer) with a small retry/backoff thing
 static void setup_reg_mq_once()
 {
-    if (g_reg_mq != (mqd_t)-1)
+    if (g_reg_mq != ( mqd_t ) - 1)
     {
         return;
     }
@@ -278,7 +286,7 @@ static void setup_reg_mq_once()
     while (tries--)
     {
         g_reg_mq = mq_open(MQ_REG_NAME, O_WRONLY | O_CLOEXEC);
-        if (g_reg_mq != (mqd_t)-1)
+        if (g_reg_mq != ( mqd_t ) - 1)
         {
             break;
         }
@@ -310,11 +318,11 @@ static void setup_reg_mq_once()
 //  - increment g_registered_count on *success* and keep log
 static bool send_registration(const PatientInfo& p)
 {
-    auto mq_to_use = (mqd_t)-1;
+    auto mq_to_use = ( mqd_t ) - 1;
     bool used_tmp  = false;
 
     // Try cached descriptor first
-    if (g_reg_mq != (mqd_t)-1)
+    if (g_reg_mq != ( mqd_t ) - 1)
     {
         mq_to_use = g_reg_mq;
     }
@@ -322,17 +330,17 @@ static bool send_registration(const PatientInfo& p)
     {
         // Attempt to lazy-open cached descriptor
         setup_reg_mq_once();
-        if (g_reg_mq != (mqd_t)-1)
+        if (g_reg_mq != ( mqd_t ) - 1)
         {
             mq_to_use = g_reg_mq;
         }
     }
 
     // If still not opened, try one-shot open
-    if (mq_to_use == (mqd_t)-1)
+    if (mq_to_use == ( mqd_t ) - 1)
     {
         mq_to_use = mq_open(MQ_REG_NAME, O_WRONLY | O_CLOEXEC);
-        if (mq_to_use == (mqd_t)-1)
+        if (mq_to_use == ( mqd_t ) - 1)
         {
             // Cannot open registration MQ, time to give up
             perror("mq_open patient->reg (final)");
@@ -370,7 +378,7 @@ static bool send_registration(const PatientInfo& p)
     // Attempt to send
     if (mq_send(mq_to_use, buf, sizeof(PatientInfo), prio) == -1)
     {
-        perror("mq_send patient");
+        // perror("mq_send patient");
         log_patient_local("send_registration: mq_send failed for id=" + std::to_string(p.id) + " errno=" + std::to_string(errno));
 
         // Rollback increment if able to update it
@@ -398,7 +406,7 @@ static bool send_registration(const PatientInfo& p)
             }
         }
 
-        if (used_tmp && mq_to_use != (mqd_t)-1)
+        if (used_tmp && mq_to_use != ( mqd_t ) - 1)
         {
             mq_close(mq_to_use);
         }
@@ -414,7 +422,7 @@ static bool send_registration(const PatientInfo& p)
         g_registered_count.fetch_add(1);
     }
 
-    if (used_tmp && mq_to_use != (mqd_t)-1)
+    if (used_tmp && mq_to_use != ( mqd_t ) - 1)
     {
         mq_close(mq_to_use);
     }
@@ -479,44 +487,34 @@ static void control_thread_fn()
             g_ctrl_sem = sem;
 
             // Use sem_timedwait with a short timeout (100 ms).
-            // This avoids the process staying blocked indefinitely if sem_wait is restartable.
             timespec ts{};
             if (clock_gettime(CLOCK_REALTIME, &ts) == -1)
             {
-                // fallback: short sleep if clock_gettime fails
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 if (!g_running)
                 {
                     break;
                 }
-
                 continue;
             }
 
-            // add 100 ms
             ts.tv_nsec += 100 * 1000 * 1000;
             if (ts.tv_nsec >= 1000000000L)
             {
-                ts.tv_sec  += ( ts.tv_nsec / 1000000000L );
+                ts.tv_sec  += ts.tv_nsec / 1000000000L;
                 ts.tv_nsec %= 1000000000L;
             }
 
-            int sret = sem_timedwait(sem, &ts);
-            if (sret == -1)
+            if (const int sret = sem_timedwait(sem, &ts); sret == -1)
             {
                 if (errno == ETIMEDOUT)
                 {
-                    // timed out — check g_running and loop again
-                    if (!g_running)
-                        break;
+                    if (!g_running) break;
                     continue;
                 }
                 if (errno == EINTR)
                 {
-                    // interrupted by a signal — re-evaluate g_running
-                    if (!g_running)
-                        break;
-                    // fall through to check slot
+                    if (!g_running) break;
                 }
                 else
                 {
@@ -532,42 +530,31 @@ static void control_thread_fn()
             woke = true;
         }
 
+        if (!g_running) break;
 
-        if (!g_running)
-        {
-            break;
-        }
-
-        // check our slot
-        ControlSlot&   slot = g_ctrl_reg->slots[static_cast<size_t>(g_ctrl_slot)];
-        const uint32_t seq  = slot.seq.load(std::memory_order_acquire);
+        ControlSlot& slot = g_ctrl_reg->slots[static_cast<size_t>(g_ctrl_slot)];
+        const uint32_t seq = slot.seq.load(std::memory_order_acquire);
         if (seq == 0)
         {
-            // spurious wake or no msg
             continue;
         }
 
-        // copy message locally
-        ControlMessage cm{};
-        cm = slot.msg;
-
-        // clear slot (set seq to 0)
+        ControlMessage cm = slot.msg;
         slot.seq.store(0, std::memory_order_release);
 
-        // Handle message (saqme handling as before)
         if (cm.cmd == CTRL_SPAWN_CHILD)
         {
-            // create child thread
-            // g_child_threads.emplace_back(child_thread_fn, cm);
+            g_child_threads.emplace_back(child_thread_fn, cm);
+            continue;
         }
-        else if (cm.cmd == CTRL_GOTO_DOCTOR)
+
+        if (cm.cmd == CTRL_GOTO_DOCTOR)
         {
-            // If this control message targets a child (target_id != 0 and not the adult id),
-            // locate the child in g_active_children and forward the child's PatientInfo to doctor MQ.
+            // child-targeted goto-doctor
             if (cm.target_id != 0 && cm.target_id != g_self.id)
             {
                 PatientInfo child{};
-                bool        found = false;
+                bool found = false;
                 {
                     std::lock_guard lock(g_children_mutex);
                     for (auto it = g_active_children.begin(); it != g_active_children.end(); ++it)
@@ -588,24 +575,35 @@ static void control_thread_fn()
                 }
                 else
                 {
-                    // Bookkeeping: decrement local registered count and shared current_inside
-                    g_registered_count.fetch_sub(1);
+                    // Defensive decrement of local registered count (don't go negative)
+                    if (const int prev_reg = g_registered_count.load(std::memory_order_acquire); prev_reg > 0)
+                    {
+                        g_registered_count.fetch_sub(1, std::memory_order_acq_rel);
+                    }
+                    else
+                    {
+                        log_patient_local("Invariant: g_registered_count already zero when forwarding child id=" + std::to_string(cm.target_id));
+                    }
 
+                    // Only update current_inside here; do NOT touch waiting_to_register (registration owns that)
                     if (g_shm_local && g_shm_sem_local)
                     {
                         if (sem_wait(g_shm_sem_local) != -1)
                         {
                             if (g_shm_local->current_inside > 0)
                             {
-                                g_shm_local->current_inside--;
+                                --g_shm_local->current_inside;
+                                log_patient_local("CTRL_GOTO_DOCTOR (child): decremented current_inside -> " + std::to_string(g_shm_local->current_inside) + " for child id=" + std::to_string(cm.target_id));
                             }
-
-                            if (g_shm_local->waiting_to_register > 0)
+                            else
                             {
-                                g_shm_local->waiting_to_register--; // optional: if you incremented earlier
+                                log_patient_local("CTRL_GOTO_DOCTOR (child): current_inside already zero for child id=" + std::to_string(cm.target_id));
                             }
 
-                            sem_post(g_shm_sem_local);
+                            if (sem_post(g_shm_sem_local) == -1)
+                            {
+                                perror("sem_post (patient forward child)");
+                            }
                         }
                         else
                         {
@@ -625,7 +623,6 @@ static void control_thread_fn()
                         {
                             log_patient_local("CTRL_GOTO_DOCTOR queued for child id=" + std::to_string(child.id) + " (priority=" + std::to_string(cm.priority) + ")");
                         }
-
                         mq_close(mq_doctor);
                     }
                     else
@@ -636,7 +633,7 @@ static void control_thread_fn()
             }
             else
             {
-                // Default: this targets the adult patient — unchanged behavior
+                // Adult behaviour unchanged
                 set_state(PatientState::SENT_TO_DOCTOR);
                 if (const mqd_t mq_doctor = mq_open(MQ_DOCTOR_NAME, O_WRONLY | O_CLOEXEC); mq_doctor != (mqd_t)-1)
                 {
@@ -655,21 +652,158 @@ static void control_thread_fn()
                     log_patient_local("CTRL_GOTO_DOCTOR: mq_open doctor failed errno=" + std::to_string(errno));
                 }
             }
+            continue;
         }
-        else if (cm.cmd == CTRL_DISMISS)
+
+        if (cm.cmd == CTRL_DISMISS)
         {
-            set_state(PatientState::DISMISSED);
-            g_exit_reason.store(DISMISSED_BY_TRIAGE);
+            if (cm.target_id != 0 && cm.target_id != g_self.id)
+            {
+                bool found = false;
+                {
+                    std::lock_guard lock(g_children_mutex);
+                    for (auto it = g_active_children.begin(); it != g_active_children.end(); ++it)
+                    {
+                        if (it->id == cm.target_id)
+                        {
+                            g_active_children.erase(it);
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (found)
+                {
+                    if (const int prev_reg = g_registered_count.load(std::memory_order_acquire); prev_reg > 0)
+                    {
+                        g_registered_count.fetch_sub(1, std::memory_order_acq_rel);
+                    }
+                    else
+                    {
+                        log_patient_local("Invariant: g_registered_count already zero on child dismiss id=" + std::to_string(cm.target_id));
+                    }
+
+                    // Only decrement current_inside; do NOT touch waiting_to_register
+                    if (g_shm_local && g_shm_sem_local)
+                    {
+                        if (sem_wait(g_shm_sem_local) != -1)
+                        {
+                            if (g_shm_local->current_inside > 0)
+                            {
+                                --g_shm_local->current_inside;
+                                log_patient_local("CTRL_DISMISS (child): decremented current_inside -> " + std::to_string(g_shm_local->current_inside) + " for child id=" + std::to_string(cm.target_id));
+                            }
+                            else
+                            {
+                                log_patient_local("CTRL_DISMISS (child): current_inside already zero for child id=" + std::to_string(cm.target_id));
+                            }
+                            if (sem_post(g_shm_sem_local) == -1)
+                            {
+                                perror("sem_post (patient child_dismiss)");
+                            }
+                        }
+                        else
+                        {
+                            perror("sem_wait (patient child_dismiss)");
+                        }
+                    }
+
+                    log_patient_local("CTRL_DISMISS (child): cleaned up child id=" + std::to_string(cm.target_id));
+                }
+                else
+                {
+                    log_patient_local("CTRL_DISMISS (child): notification for id=" + std::to_string(cm.target_id) + " but not found locally");
+                }
+            }
+            else
+            {
+                // Adult patient
+                set_state(PatientState::DISMISSED);
+                g_exit_reason.store(DISMISSED_BY_TRIAGE);
+                g_running = false;
+                log_patient_local("CTRL_DISMISS: adult dismissed by triage");
+            }
+
+            continue;
+        }
+
+        if (cm.cmd == CTRL_CHILD_TREATED)
+        {
+            // Parent receives notification that a child (target_id) was treated.
+            bool found = false;
+            {
+                std::lock_guard lock(g_children_mutex);
+                for (auto it = g_active_children.begin(); it != g_active_children.end(); ++it)
+                {
+                    if (it->id == cm.target_id)
+                    {
+                        g_active_children.erase(it);
+                        found = true;
+                        break;
+                    }
+                }
+            }
+
+            if (found)
+            {
+                if (const int prev_reg = g_registered_count.load(std::memory_order_acquire); prev_reg > 0)
+                {
+                    g_registered_count.fetch_sub(1, std::memory_order_acq_rel);
+                }
+                else
+                {
+                    log_patient_local("Invariant: g_registered_count already zero on child_treated id=" + std::to_string(cm.target_id));
+                }
+
+                // Only decrement current_inside; do NOT touch waiting_to_register
+                if (g_shm_local && g_shm_sem_local)
+                {
+                    if (sem_wait(g_shm_sem_local) != -1)
+                    {
+                        if (g_shm_local->current_inside > 0)
+                        {
+                            --g_shm_local->current_inside;
+                            log_patient_local("CTRL_CHILD_TREATED: decremented current_inside -> " + std::to_string(g_shm_local->current_inside) + " for child id=" + std::to_string(cm.target_id));
+                        }
+                        else
+                        {
+                            log_patient_local("CTRL_CHILD_TREATED: current_inside already zero for child id=" + std::to_string(cm.target_id));
+                        }
+                        if (sem_post(g_shm_sem_local) == -1)
+                        {
+                            perror("sem_post (patient child_treated)");
+                        }
+                    }
+                    else
+                    {
+                        perror("sem_wait (patient child_treated)");
+                    }
+                }
+
+                log_patient_local("CTRL_CHILD_TREATED: cleaned up child id=" + std::to_string(cm.target_id));
+            }
+            else
+            {
+                log_patient_local("CTRL_CHILD_TREATED: parent notified for child id=" + std::to_string(cm.target_id) + " (not found locally)");
+            }
+            continue;
+        }
+
+        if (cm.cmd == CTRL_SHUTDOWN)
+        {
             g_running = false;
+            continue;
         }
-        else if (cm.cmd == CTRL_SHUTDOWN)
+
+        if (cm.cmd == CTRL_INSIDE)
         {
-            g_running = false;
+            set_state(PatientState::WAITING_TRIAGE);
+            log_patient_local("CTRL_INSIDE: admitted to waiting room");
+            continue;
         }
-        else
-        {
-            log_patient_local("control_thread: unknown cmd=" + std::to_string(static_cast<int>(cm.cmd)));
-        }
+
+        log_patient_local("control_thread: unknown cmd=" + std::to_string(static_cast<int>(cm.cmd)));
     }
 
     if (sem != SEM_FAILED)
@@ -678,6 +812,7 @@ static void control_thread_fn()
         g_ctrl_sem = SEM_FAILED;
     }
 }
+
 
 
 static void sig_treated_handler(int)
@@ -770,10 +905,10 @@ static void cleanup_local()
         }
     }
 
-    if (g_reg_mq != (mqd_t)-1)
+    if (g_reg_mq != ( mqd_t ) - 1)
     {
         mq_close(g_reg_mq);
-        g_reg_mq = (mqd_t)-1;
+        g_reg_mq = ( mqd_t ) - 1;
     }
 
     if (g_ctrl_reg && g_ctrl_slot >= 0)
@@ -901,7 +1036,6 @@ int main(const int argc, char** argv)
     g_self.is_vip = is_vip;
     strncpy(g_self.symptoms, "adult symptoms", sizeof( g_self.symptoms ) - 1);
     g_self.symptoms[sizeof( g_self.symptoms ) - 1] = '\0';
-
 
     // Send registration
     if (const bool ok = send_registration(g_self); !ok)

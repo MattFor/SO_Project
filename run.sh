@@ -74,28 +74,23 @@ BUILD_DIR="build"
 BIN_DIR="${BUILD_DIR}/bin"
 
 WAITING_ROOM_SIZE=1000
-DOCTORS=100
-PATIENTS=1000000
+DOCTORS=10
+PATIENTS=5000
 
 raise_realtime_limits() {
     log "REALTIME: Raising hard resource limits (best-effort)"
 
-    # ---- ulimits ----
     ulimit -n 1048576  || log "REALTIME: failed to raise open files (ulimit -n)"
     ulimit -u unlimited || log "REALTIME: failed to raise process limit (ulimit -u)"
     ulimit -s unlimited || log "REALTIME: failed to raise stack size (ulimit -s)"
     ulimit -c unlimited || log "REALTIME: failed to enable core dumps (ulimit -c)"
 
-    # ---- kernel sysctls ----
-    # PID / task limits
     sysctl -w kernel.pid_max=4194303        || log "REALTIME: pid_max not changed"
     sysctl -w kernel.threads-max=4194303    || log "REALTIME: threads-max not changed"
 
-    # POSIX message queues
     sysctl -w fs.mqueue.msg_max=16384       || log "REALTIME: mqueue msg_max not changed"
     sysctl -w fs.mqueue.queues_max=2048     || log "REALTIME: mqueue queues_max not changed"
 
-    # Scheduler friendliness (optional but good for RT load)
     sysctl -w kernel.sched_migration_cost_ns=5000000 || true
 }
 
