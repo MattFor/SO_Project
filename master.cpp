@@ -1507,12 +1507,12 @@ static void input_thread_fn(std::atomic_bool& stop_flag, pid_t& reg1_pid, pid_t&
 
                 std::cout << "uptime: " << std::fixed << std::setprecision(2) << elapsed << " s\n";
 
-                std::cout << "spawned adults: " << adults << " (avg " << adult_rate << " /s)\n";
-
-                if constexpr (ADULTS_ONLY == 0)
-                {
-                    std::cout << "spawned children: " << children << " (avg " << child_rate << " /s)\n";
-                }
+                // std::cout << "spawned adults: " << adults << " (avg " << adult_rate << " /s)\n";
+                //
+                // if constexpr (ADULTS_ONLY == 0)
+                // {
+                //     std::cout << "spawned children: " << children << " (avg " << child_rate << " /s)\n";
+                // }
 
                 std::cout << "total spawned: " << total << " (avg " << total_rate << " /s)\n";
 
