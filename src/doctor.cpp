@@ -15,8 +15,8 @@
 #include "../include/Utilities.h"
 
 // shared control attachments
-static int              shm_fd   = -1;
-static size_t           shm_size = 0;
+static int    shm_fd   = -1;
+static size_t shm_size = 0;
 
 static sem_t*           shm_sem  = nullptr;
 static ERShared*        ctrl     = nullptr; // Real shared header struct
@@ -152,9 +152,9 @@ static void handle_child_treated(const PatientInfo& p, int doc_id)
         cm.priority   = 0;
 
         const mqd_t mq_ctrl = mq_open(MQ_PATIENT_CTRL, O_WRONLY | O_CLOEXEC);
-        if (mq_ctrl != (mqd_t)-1)
+        if (mq_ctrl != ( mqd_t ) - 1)
         {
-            if (mq_send(mq_ctrl, reinterpret_cast<const char*>(&cm), sizeof(cm), 0) == -1)
+            if (mq_send(mq_ctrl, reinterpret_cast<const char*>(&cm), sizeof( cm ), 0) == -1)
             {
                 log_doc("Failed to notify parent pid=" + std::to_string(p.pid) + " of child treated id=" + std::to_string(p.id) + " errno=" + std::to_string(errno));
             }

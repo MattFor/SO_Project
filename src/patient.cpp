@@ -55,6 +55,7 @@ enum ExitReason
     TREATED,
     EVACUATED,
     DISMISSED_BY_TRIAGE,
+
     OTHER_SIG
 };
 
@@ -62,11 +63,11 @@ static std::atomic g_exit_reason{NONE};
 
 enum class PatientState : uint8_t
 {
-    REGISTERED,
-    WAITING_TRIAGE,
-    SENT_TO_DOCTOR,
     TREATED,
-    DISMISSED
+    DISMISSED,
+    REGISTERED,
+    SENT_TO_DOCTOR,
+    WAITING_TRIAGE
 };
 
 static std::atomic           g_state{PatientState::REGISTERED};
@@ -194,8 +195,7 @@ static bool setup_control_registry()
 
             const size_t      bucket = slot_to_bucket(idx);
             const std::string sname  = ctrl_sem_name(bucket);
-            sem_t*            sem    = sem_open(sname.c_str(), O_CREAT, IPC_MODE, 0);
-            if (sem == SEM_FAILED)
+            if (sem_t* sem = sem_open(sname.c_str(), O_CREAT, IPC_MODE, 0); sem == SEM_FAILED)
             {
                 perror("sem_open patient register");
             }
@@ -263,7 +263,7 @@ void release_waiting_room_slot_once()
     }
     else
     {
-        const int to_release = std::min(remaining, static_cast<int>(g_shm_local->current_inside));
+        const int to_release        = std::min(remaining, static_cast<int>(g_shm_local->current_inside));
         g_shm_local->current_inside -= to_release;
         log_patient_local("Released slots in batch: remaining=" + std::to_string(remaining) + " to_release=" + std::to_string(to_release) + " current_inside_now=" + std::to_string(g_shm_local->current_inside));
     }
@@ -509,12 +509,14 @@ static void control_thread_fn()
             {
                 if (errno == ETIMEDOUT)
                 {
-                    if (!g_running) break;
+                    if (!g_running)
+                        break;
                     continue;
                 }
                 if (errno == EINTR)
                 {
-                    if (!g_running) break;
+                    if (!g_running)
+                        break;
                 }
                 else
                 {
@@ -530,11 +532,13 @@ static void control_thread_fn()
             woke = true;
         }
 
-        if (!g_running) break;
+        if (!g_running)
+        {
+            break;
+        }
 
-        ControlSlot& slot = g_ctrl_reg->slots[static_cast<size_t>(g_ctrl_slot)];
-        const uint32_t seq = slot.seq.load(std::memory_order_acquire);
-        if (seq == 0)
+        ControlSlot&   slot = g_ctrl_reg->slots[static_cast<size_t>(g_ctrl_slot)];
+        if (const uint32_t seq  = slot.seq.load(std::memory_order_acquire); seq == 0)
         {
             continue;
         }
@@ -554,7 +558,7 @@ static void control_thread_fn()
             if (cm.target_id != 0 && cm.target_id != g_self.id)
             {
                 PatientInfo child{};
-                bool found = false;
+                bool        found = false;
                 {
                     std::lock_guard lock(g_children_mutex);
                     for (auto it = g_active_children.begin(); it != g_active_children.end(); ++it)
@@ -613,7 +617,7 @@ static void control_thread_fn()
 
                     // Forward child to doctor MQ
                     mqd_t mq_doctor = mq_open(MQ_DOCTOR_NAME, O_WRONLY | O_CLOEXEC);
-                    if (mq_doctor != (mqd_t)-1)
+                    if (mq_doctor != ( mqd_t ) - 1)
                     {
                         if (mq_send(mq_doctor, reinterpret_cast<char*>(&child), sizeof(PatientInfo), cm.priority) == -1)
                         {
@@ -635,7 +639,7 @@ static void control_thread_fn()
             {
                 // Adult behaviour unchanged
                 set_state(PatientState::SENT_TO_DOCTOR);
-                if (const mqd_t mq_doctor = mq_open(MQ_DOCTOR_NAME, O_WRONLY | O_CLOEXEC); mq_doctor != (mqd_t)-1)
+                if (const mqd_t mq_doctor = mq_open(MQ_DOCTOR_NAME, O_WRONLY | O_CLOEXEC); mq_doctor != ( mqd_t ) - 1)
                 {
                     if (mq_send(mq_doctor, reinterpret_cast<char*>(&g_self), sizeof(PatientInfo), cm.priority) == -1)
                     {
@@ -812,7 +816,6 @@ static void control_thread_fn()
         g_ctrl_sem = SEM_FAILED;
     }
 }
-
 
 
 static void sig_treated_handler(int)

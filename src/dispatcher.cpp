@@ -123,7 +123,7 @@ int main()
     }
 
     const mqd_t mq_ctrl = mq_open(MQ_PATIENT_CTRL, O_RDONLY | O_CLOEXEC);
-    if (mq_ctrl == (mqd_t)-1)
+    if (mq_ctrl == ( mqd_t ) - 1)
     {
         perror("mq_open MQ_PATIENT_CTRL");
         log_dispatcher(std::string("mq_open(MQ_PATIENT_CTRL) failed errno=") + std::to_string(errno));
@@ -141,7 +141,7 @@ int main()
 
     while (true)
     {
-        const ssize_t r = mq_receive(mq_ctrl, buf, sizeof(buf), &prio);
+        const ssize_t r = mq_receive(mq_ctrl, buf, sizeof( buf ), &prio);
         if (r == -1)
         {
             if (errno == EINTR)
@@ -160,7 +160,7 @@ int main()
         }
 
         ControlMessage cm{};
-        memcpy(&cm, buf, sizeof(cm));
+        memcpy(&cm, buf, sizeof( cm ));
 
         if (cm.target_pid == 0)
         {
@@ -174,10 +174,7 @@ int main()
 
             if (!slot.rdy.load(std::memory_order_acquire))
             {
-                log_dispatcher(
-                    "Slot found for pid=" + std::to_string(cm.target_pid) +
-                    " but slot not ready — deferring message"
-                );
+                log_dispatcher("Slot found for pid=" + std::to_string(cm.target_pid) + " but slot not ready — deferring message");
                 continue;
             }
 

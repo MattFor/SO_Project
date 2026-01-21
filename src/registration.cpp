@@ -101,7 +101,7 @@ int main(const int argc, char** argv)
 
     // Open message queues
     const mqd_t mq_reg = mq_open(MQ_REG_NAME, O_RDONLY | O_CLOEXEC);
-    if (mq_reg == (mqd_t)-1)
+    if (mq_reg == ( mqd_t ) - 1)
     {
         perror("mq_open reg read");
         cleanup();
@@ -109,7 +109,7 @@ int main(const int argc, char** argv)
     }
 
     const mqd_t mq_triage = mq_open(MQ_TRIAGE_NAME, O_WRONLY | O_CLOEXEC);
-    if (mq_triage == (mqd_t)-1)
+    if (mq_triage == ( mqd_t ) - 1)
     {
         perror("mq_open triage write");
         cleanup();
@@ -178,7 +178,7 @@ int main(const int argc, char** argv)
 
                 const mqd_t mq_ctrl = mq_open(MQ_PATIENT_CTRL, O_WRONLY | O_CLOEXEC);
 
-                if (mq_ctrl != (mqd_t)-1)
+                if (mq_ctrl != ( mqd_t ) - 1)
                 {
                     if (mq_send(mq_ctrl, reinterpret_cast<const char*>(&cm), sizeof( cm ), 0) == -1)
                     {

@@ -17,8 +17,8 @@
 
 static FILE* triage_log = nullptr;
 
-static size_t           shm_size = 0;
-static int              shm_fd   = -1;
+static size_t shm_size = 0;
+static int    shm_fd   = -1;
 
 static sem_t*           shm_sem  = nullptr;
 static ERShared*        ctrl     = nullptr;
@@ -120,13 +120,13 @@ int main()
     }
 
     const mqd_t mq_triage = mq_open(MQ_TRIAGE_NAME, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
-    if (mq_triage == (mqd_t)-1)
+    if (mq_triage == ( mqd_t ) - 1)
     {
         perror("mq_open triage");
         return 1;
     }
 
-    std::default_random_engine             rng(static_cast<unsigned>(time(nullptr)));
+    std::default_random_engine     rng(static_cast<unsigned>(time(nullptr)));
     std::uniform_real_distribution uni(0.0, 1.0);
 
     char buf[MAX_MSG_SIZE];
@@ -179,7 +179,7 @@ int main()
                 cm.target_id  = p.id;
                 cm.priority   = 0;
 
-                if (mqd_t mq_ctrl = mq_open(MQ_PATIENT_CTRL, O_WRONLY | O_CLOEXEC); mq_ctrl != (mqd_t)-1)
+                if (mqd_t mq_ctrl = mq_open(MQ_PATIENT_CTRL, O_WRONLY | O_CLOEXEC); mq_ctrl != ( mqd_t ) - 1)
                 {
                     mq_send(mq_ctrl, reinterpret_cast<const char*>(&cm), sizeof( cm ), 0);
                     mq_close(mq_ctrl);
@@ -214,7 +214,7 @@ int main()
 
         const mqd_t mq_ctrl = mq_open(MQ_PATIENT_CTRL, O_WRONLY | O_CLOEXEC);
 
-        if (mq_ctrl == (mqd_t)-1)
+        if (mq_ctrl == ( mqd_t ) - 1)
         {
             log_tri("FAILED mq_open MQ_PATIENT_CTRL errno=" + std::to_string(errno));
             continue;

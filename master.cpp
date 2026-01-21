@@ -27,6 +27,7 @@
 
 static constexpr int ADULTS_ONLY = 110; // 0 or 100
 
+
 static int       g_N          = 10;
 static int       g_shm_fd     = -1;
 static ERShared* g_shm        = nullptr;
@@ -38,9 +39,10 @@ static std::mutex       g_patient_mutex;
 static bool             exit_on_no_patients = false;
 static std::atomic_bool g_shutdown_requested{false};
 
-static std::atomic_bool g_ipc_lost{false};        // Set by check_ipc_presence()
+static std::atomic_bool g_ipc_lost{false};  // Set by check_ipc_presence()
+static std::atomic_int  g_signal_number{0}; // Which signal was seen
+static std::atomic_int  g_spawned_children{0};
 static std::atomic_bool g_signal_received{false}; // Set by real signal handler
-static std::atomic_int  g_signal_number{0};       // Which signal was seen
 
 static constexpr int   MAX_CONCURRENT_PROCESSES = 10000;
 static std::atomic_int g_current_processes{1};
@@ -257,6 +259,23 @@ static void terminate_service_graceful(pid_t& pid, const std::string& name)
     }
 
     pid = -1;
+}
+
+static bool patient_slot_ready(pid_t pid)
+{
+    if (pid <= 0 || !g_ctrl_reg)
+    {
+        return false;
+    }
+
+    for (auto & slot : g_ctrl_reg->slots)
+    {
+        if (const pid_t owner = slot.pid.load(std::memory_order_acquire); owner == pid)
+        {
+            return slot.rdy.load(std::memory_order_acquire) != 0;
+        }
+    }
+    return false;
 }
 
 static void terminate_patients_graceful(std::vector<pid_t>& adult_patient_pids)
@@ -811,6 +830,8 @@ static bool send_spawn_child_to_patient(const pid_t target_pid, ControlMessage c
     mq_close(mq);
     log_master("send_spawn_child_to_patient: sent CTRL_SPAWN_CHILD id=" + std::to_string(cm.child_id) + " to target pid=" + std::to_string(target_pid));
 
+    g_spawned_children.fetch_add(1, std::memory_order_relaxed);
+
     return true;
 }
 
@@ -1148,7 +1169,7 @@ static void input_thread_fn(std::atomic_bool& stop_flag, pid_t& reg1_pid, pid_t&
 
                         for (int i = 0; i < N && !g_shutdown_requested.load(); ++i)
                         {
-                            int  age      = local_rng() % 80 + 1;
+                            int  age      = local_rng() % 80 + 1 + ADULTS_ONLY;
                             bool is_child = age < 18;
                             bool is_vip   = local_rng() % 100 < 5;
                             int  my_id    = next_id.fetch_add(1);
@@ -1248,7 +1269,7 @@ static void input_thread_fn(std::atomic_bool& stop_flag, pid_t& reg1_pid, pid_t&
 
                         for (int i = 0; i < maxN && !g_shutdown_requested.load(); ++i)
                         {
-                            int  age      = local_rng() % 80 + 1;
+                            int  age      = local_rng() % 80 + 1 + ADULTS_ONLY;
                             bool is_child = age < 18;
                             bool is_vip   = local_rng() % 100 < 5;
                             int  my_id    = next_id.fetch_add(1);
@@ -1458,6 +1479,7 @@ static void input_thread_fn(std::atomic_bool& stop_flag, pid_t& reg1_pid, pid_t&
                 std::cout << "doctor MQ messages: " << ( doc_q >= 0 ? std::to_string(doc_q) : "err" ) << "\n";
                 std::cout << "pending children (master queue): " << pending_children.size() << "\n";
                 std::cout << "total processed (shared): " << treated << "\n";
+                std::cout << "spawned children: " << g_spawned_children.load(std::memory_order_relaxed) << "\n";
                 log_master("input_thread: list command executed");
             }
             else if (cmd == "quit" || cmd == "shutdown" || cmd == "exit")
