@@ -25,12 +25,12 @@
 
 #include "include/Utilities.h"
 
-static constexpr int ADULTS_ONLY = 0; // 0 or 100
+static constexpr int ADULTS_ONLY = 110; // 0 or 100
 
-static ERShared* g_shm        = nullptr;
-static int       g_shm_fd     = -1;
-static sem_t*    g_shm_sem    = nullptr;
 static int       g_N          = 10;
+static int       g_shm_fd     = -1;
+static ERShared* g_shm        = nullptr;
+static sem_t*    g_shm_sem    = nullptr;
 static FILE*     master_log   = nullptr;
 static FILE*     patients_log = nullptr;
 
@@ -42,7 +42,7 @@ static std::atomic_bool g_ipc_lost{false};        // Set by check_ipc_presence()
 static std::atomic_bool g_signal_received{false}; // Set by real signal handler
 static std::atomic_int  g_signal_number{0};       // Which signal was seen
 
-static constexpr int   MAX_CONCURRENT_PROCESSES = 20000;
+static constexpr int   MAX_CONCURRENT_PROCESSES = 10000;
 static std::atomic_int g_current_processes{1};
 
 static ControlRegistry* g_ctrl_reg = nullptr;
@@ -579,35 +579,56 @@ static pid_t spawn_process(const std::string& path, const std::vector<std::strin
 
 static pid_t spawn_process_limited(const std::string& path, const std::vector<std::string>& args)
 {
+    using clock = std::chrono::steady_clock;
+
+    thread_local auto last_spawn = clock::now();
+
     while (!g_shutdown_requested.load())
     {
-        constexpr int backoff_ms = 10 * 1000;
-        const int     cur        = g_current_processes.load(std::memory_order_relaxed);
+        const int cur = g_current_processes.load(std::memory_order_relaxed);
 
         if (cur >= MAX_CONCURRENT_PROCESSES)
         {
-            std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
             continue;
         }
 
-        if (int expected = cur; g_current_processes.compare_exchange_strong(expected, cur + 1))
-        {
-            const pid_t pid = spawn_process(path, args);
-            if (pid <= 0)
-            {
-                g_current_processes.fetch_sub(1);
-                return -1;
-            }
+        const double pressure = static_cast<double>(cur) / static_cast<double>(MAX_CONCURRENT_PROCESSES);
 
-            return pid;
+        double delay_ms = 0.0;
+        if (constexpr double PRESSURE_START = 0.40; pressure > PRESSURE_START)
+        {
+            constexpr double MAX_DELAY_MS = 1200.0;
+            const double     x            = ( pressure - PRESSURE_START ) / ( 1.0 - PRESSURE_START ); // normalize → [0,1]
+
+            delay_ms = x * x * x * MAX_DELAY_MS;
         }
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
+        if (const auto now = clock::now(); delay_ms > 0 && now - last_spawn < std::chrono::milliseconds(static_cast<int>(delay_ms)))
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            continue;
+        }
+
+
+        if (int expected = cur; !g_current_processes.compare_exchange_weak(expected, cur + 1, std::memory_order_acq_rel))
+        {
+            continue;
+        }
+
+        const pid_t pid = spawn_process(path, args);
+        if (pid <= 0)
+        {
+            g_current_processes.fetch_sub(1, std::memory_order_release);
+            return -1;
+        }
+
+        last_spawn = clock::now();
+        return pid;
     }
 
     return -1;
 }
-
 
 // Create message queues and shared resources
 static bool setup_ipc()
@@ -1142,8 +1163,8 @@ static void input_thread_fn(std::atomic_bool& stop_flag, pid_t& reg1_pid, pid_t&
                                 strncpy(cm.symptoms, "child symptoms", sizeof( cm.symptoms ) - 1);
                                 cm.symptoms[sizeof( cm.symptoms ) - 1] = '\0';
 
-                                bool dispatched = false;
                                 {
+                                    bool            dispatched = false;
                                     std::lock_guard lk(g_patient_mutex);
                                     std::erase_if(adult_patient_pids, [](const pid_t p)
                                     {

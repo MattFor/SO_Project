@@ -50,7 +50,7 @@ struct ControlMessage
     char symptoms[128];
 
     int priority;
-	int target_id;
+    int target_id;
     int target_pid;
 };
 
@@ -68,7 +68,7 @@ struct ERShared
     bool second_reg_open; // Whether second registration window is open
     bool evacuation;      // Set by SIGUSR2
 
-	int doctors_online;
+    int doctors_online;
 
     // Padding
     char pad[24];
@@ -77,14 +77,12 @@ struct ERShared
 static constexpr size_t MAX_QUEUE_MESSAGES = 32;
 static constexpr size_t MAX_MSG_SIZE       = 2048;
 
-// Patient struct info marshaled as string
 struct PatientInfo
 {
     int  id;
-    int  pid; // Process id of patient process
+    int  pid;
     int  age;
     bool is_vip;
-    // Symptoms string (short)
     char symptoms[128];
 };
 
@@ -103,50 +101,41 @@ inline std::string timestamp()
     char buf[64];
     strftime(buf, sizeof( buf ), "%Y-%m-%d %H:%M:%S", &tm);
 
-    // Append milliseconds
     char final_buf[80];
     std::snprintf(final_buf, sizeof( final_buf ), "%s.%03ld", buf, ts.tv_nsec / 1000000L);
 
     return std::string(final_buf);
 }
 
-// Control registry: fixed size array of slots (one per potential patient).
-// Registry size should be >= max concurrent live patients (choose 131072 or similar).
-static constexpr size_t CTRL_REGISTRY_SIZE = 262144;//131072; // tune as needed
-static constexpr size_t CTRL_SEM_BUCKETS    = 1024;   // small, power-of-two preferred
+static constexpr size_t CTRL_SEM_BUCKETS   = 1024;
+static constexpr size_t CTRL_REGISTRY_SIZE = 262144;
 
 struct ControlSlot
 {
-    std::atomic<uint32_t> seq;      // sequence number: 0 == empty, nonzero -> message available
-    std::atomic<pid_t>    pid;      // owner pid (0 if empty)  <-- make atomic
-    ControlMessage        msg;      // message storage
-    char pad[32];
+    std::atomic<uint32_t> seq;
+    std::atomic<pid_t>    pid;
+    std::atomic<uint8_t>  rdy;
+    ControlMessage        msg;
+    char                  pad[32];
 };
 
-// Control region placed in shm alongside ERShared; address returned by shm_open(SHM_NAME)
 struct ControlRegistry
 {
-    // A very small header to indicate initialization
-    uint32_t initialized;
-    // fixed-size slots
-    ControlSlot slots[CTRL_REGISTRY_SIZE];
-    // sequence counter used for slot allocation (simple round-robin starting point)
+    uint32_t              initialized;
+    ControlSlot           slots[CTRL_REGISTRY_SIZE];
     std::atomic<uint32_t> alloc_cursor;
 };
 
-// Names for semaphore buckets: we will create named semaphores
-// Use pattern "/er_ctrl_sem_<i>" (i in [0, CTRL_SEM_BUCKETS))
-static inline std::string ctrl_sem_name(size_t bucket)
+static std::string ctrl_sem_name(const size_t bucket)
 {
     char buf[64];
-    std::snprintf(buf, sizeof(buf), "/er_ctrl_sem_%zu", bucket);
+    std::snprintf(buf, sizeof( buf ), "/er_ctrl_sem_%zu", bucket);
     return std::string(buf);
 }
 
-// Hash function to map slot index -> semaphore bucket
-static inline size_t slot_to_bucket(size_t slot_idx)
+static size_t slot_to_bucket(const size_t slot_idx)
 {
-    return slot_idx & (CTRL_SEM_BUCKETS - 1); // CTRL_SEM_BUCKETS must be power of two
+    return slot_idx & CTRL_SEM_BUCKETS - 1;
 }
 
 

@@ -1037,6 +1037,8 @@ int main(const int argc, char** argv)
     strncpy(g_self.symptoms, "adult symptoms", sizeof( g_self.symptoms ) - 1);
     g_self.symptoms[sizeof( g_self.symptoms ) - 1] = '\0';
 
+    g_ctrl_reg->slots[g_ctrl_slot].rdy.store(1, std::memory_order_release);
+
     // Send registration
     if (const bool ok = send_registration(g_self); !ok)
     {
@@ -1073,8 +1075,9 @@ int main(const int argc, char** argv)
         }
     }
 
-
     g_running = false;
+
+    g_ctrl_reg->slots[g_ctrl_slot].rdy.store(0, std::memory_order_release);
 
     if (g_ctrl_thread.joinable())
     {

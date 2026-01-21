@@ -172,6 +172,15 @@ int main()
         {
             ControlSlot& slot = g_ctrl_reg->slots[slot_idx];
 
+            if (!slot.rdy.load(std::memory_order_acquire))
+            {
+                log_dispatcher(
+                    "Slot found for pid=" + std::to_string(cm.target_pid) +
+                    " but slot not ready — deferring message"
+                );
+                continue;
+            }
+
             // Write message and publish via seq increment (non-zero => available)
             const uint32_t nextseq = slot.seq.load(std::memory_order_relaxed) + 1;
             slot.msg               = cm;
