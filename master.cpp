@@ -10,6 +10,7 @@
 #include <vector>
 #include <chrono>
 #include <csignal>
+#include <iomanip>
 #include <cstring>
 #include <fcntl.h>
 #include <sstream>
@@ -25,8 +26,9 @@
 
 #include "include/Utilities.h"
 
-static constexpr int ADULTS_ONLY = 110; // 0 or 100
+static const auto g_program_start = std::chrono::steady_clock::now();
 
+static constexpr int ADULTS_ONLY = 110; // 0 or 100
 
 static int       g_N          = 10;
 static int       g_shm_fd     = -1;
@@ -41,10 +43,11 @@ static std::atomic_bool g_shutdown_requested{false};
 
 static std::atomic_bool g_ipc_lost{false};  // Set by check_ipc_presence()
 static std::atomic_int  g_signal_number{0}; // Which signal was seen
+static std::atomic_long g_spawned_adults{0};
 static std::atomic_int  g_spawned_children{0};
 static std::atomic_bool g_signal_received{false}; // Set by real signal handler
 
-static constexpr int   MAX_CONCURRENT_PROCESSES = 10000;
+static constexpr int   MAX_CONCURRENT_PROCESSES = 12500;
 static std::atomic_int g_current_processes{1};
 
 static ControlRegistry* g_ctrl_reg = nullptr;
@@ -68,6 +71,12 @@ static void log_master(const std::string& s)
         }
         fflush(master_log);
     }
+}
+
+static double seconds_since_start()
+{
+    using namespace std::chrono;
+    return duration_cast<duration<double>>(steady_clock::now() - g_program_start).count();
 }
 
 static bool is_pid_alive(const pid_t pid)
@@ -268,7 +277,7 @@ static bool patient_slot_ready(pid_t pid)
         return false;
     }
 
-    for (auto & slot : g_ctrl_reg->slots)
+    for (auto& slot : g_ctrl_reg->slots)
     {
         if (const pid_t owner = slot.pid.load(std::memory_order_acquire); owner == pid)
         {
@@ -1094,6 +1103,8 @@ static void input_thread_fn(std::atomic_bool& stop_flag, pid_t& reg1_pid, pid_t&
                         {
                             if (pid_t pid = spawn_process_limited("./patient", {std::to_string(my_id), std::to_string(age), is_vip ? "1" : "0"}); pid > 0)
                             {
+                                g_spawned_adults.fetch_add(1, std::memory_order_relaxed);
+
                                 {
                                     std::lock_guard lk(g_patient_mutex);
                                     adult_patient_pids.push_back(pid);
@@ -1222,6 +1233,8 @@ static void input_thread_fn(std::atomic_bool& stop_flag, pid_t& reg1_pid, pid_t&
                             {
                                 if (pid_t pid = spawn_process_limited("./patient", {std::to_string(my_id), std::to_string(age), is_vip ? "1" : "0"}); pid > 0)
                                 {
+                                    g_spawned_adults.fetch_add(1, std::memory_order_relaxed);
+
                                     {
                                         std::lock_guard lk(g_patient_mutex);
                                         adult_patient_pids.push_back(pid);
@@ -1322,6 +1335,8 @@ static void input_thread_fn(std::atomic_bool& stop_flag, pid_t& reg1_pid, pid_t&
                             {
                                 if (pid_t pid = spawn_process_limited("./patient", {std::to_string(my_id), std::to_string(age), is_vip ? "1" : "0"}); pid > 0)
                                 {
+                                    g_spawned_adults.fetch_add(1, std::memory_order_relaxed);
+
                                     {
                                         std::lock_guard lk(g_patient_mutex);
                                         adult_patient_pids.push_back(pid);
@@ -1441,6 +1456,16 @@ static void input_thread_fn(std::atomic_bool& stop_flag, pid_t& reg1_pid, pid_t&
             }
             else if (cmd == "list")
             {
+                const double elapsed = seconds_since_start();
+
+                const long adults   = g_spawned_adults.load(std::memory_order_relaxed);
+                const long children = g_spawned_children.load(std::memory_order_relaxed);
+                const long total    = adults + children;
+
+                const double adult_rate = elapsed > 0 ? adults / elapsed : 0.0;
+                const double child_rate = elapsed > 0 ? children / elapsed : 0.0;
+                const double total_rate = elapsed > 0 ? total / elapsed : 0.0;
+
                 int reg_q    = mq_curmsgs_safe(MQ_REG_NAME);
                 int triage_q = mq_curmsgs_safe(MQ_TRIAGE_NAME);
                 int doc_q    = mq_curmsgs_safe(MQ_DOCTOR_NAME);
@@ -1479,7 +1504,18 @@ static void input_thread_fn(std::atomic_bool& stop_flag, pid_t& reg1_pid, pid_t&
                 std::cout << "doctor MQ messages: " << ( doc_q >= 0 ? std::to_string(doc_q) : "err" ) << "\n";
                 std::cout << "pending children (master queue): " << pending_children.size() << "\n";
                 std::cout << "total processed (shared): " << treated << "\n";
-                std::cout << "spawned children: " << g_spawned_children.load(std::memory_order_relaxed) << "\n";
+
+                std::cout << "uptime: " << std::fixed << std::setprecision(2) << elapsed << " s\n";
+
+                std::cout << "spawned adults: " << adults << " (avg " << adult_rate << " /s)\n";
+
+                if constexpr (ADULTS_ONLY == 0)
+                {
+                    std::cout << "spawned children: " << children << " (avg " << child_rate << " /s)\n";
+                }
+
+                std::cout << "total spawned: " << total << " (avg " << total_rate << " /s)\n";
+
                 log_master("input_thread: list command executed");
             }
             else if (cmd == "quit" || cmd == "shutdown" || cmd == "exit")
@@ -1724,6 +1760,8 @@ int main(int argc, char** argv)
             {
                 if (pid_t pid = spawn_process_limited("./patient", {std::to_string(my_id), std::to_string(age), is_vip ? "1" : "0"}); pid > 0)
                 {
+                    g_spawned_adults.fetch_add(1, std::memory_order_relaxed);
+
                     {
                         std::lock_guard lk(g_patient_mutex);
                         adult_patient_pids.push_back(pid);
