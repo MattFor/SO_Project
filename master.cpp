@@ -10,6 +10,7 @@
 #include <vector>
 #include <chrono>
 #include <csignal>
+#include <iomanip>
 #include <cstring>
 #include <fcntl.h>
 #include <sstream>
@@ -25,10 +26,14 @@
 
 #include "include/Utilities.h"
 
-static ERShared* g_shm        = nullptr;
-static int       g_shm_fd     = -1;
-static sem_t*    g_shm_sem    = nullptr;
+static const auto g_program_start = std::chrono::steady_clock::now();
+
+static constexpr int ADULTS_ONLY = 110; // 0 or 100
+
 static int       g_N          = 10;
+static int       g_shm_fd     = -1;
+static ERShared* g_shm        = nullptr;
+static sem_t*    g_shm_sem    = nullptr;
 static FILE*     master_log   = nullptr;
 static FILE*     patients_log = nullptr;
 
@@ -36,9 +41,32 @@ static std::mutex       g_patient_mutex;
 static bool             exit_on_no_patients = false;
 static std::atomic_bool g_shutdown_requested{false};
 
-static std::atomic_bool g_ipc_lost{false};        // Set by check_ipc_presence()
+static std::atomic_bool g_ipc_lost{false};  // Set by check_ipc_presence()
+static std::atomic_int  g_signal_number{0}; // Which signal was seen
+static std::atomic_long g_spawned_adults{0};
+static std::atomic_int  g_spawned_children{0};
 static std::atomic_bool g_signal_received{false}; // Set by real signal handler
-static std::atomic_int  g_signal_number{0};       // Which signal was seen
+
+static constexpr int   MAX_CONCURRENT_PROCESSES = 12500;
+static std::atomic_int g_current_processes{1};
+
+static ControlRegistry* g_ctrl_reg = nullptr;
+
+static int   g_total_shm_sz   = 0;
+static pid_t g_dispatcher_pid = -1;
+
+static constexpr auto COLOR_RESET   = "\x1b[0m";
+static constexpr auto COLOR_RED     = "\x1b[31m";
+static constexpr auto COLOR_GREEN   = "\x1b[32m";
+static constexpr auto COLOR_YELLOW  = "\x1b[33m";
+static constexpr auto COLOR_BLUE    = "\x1b[34m";
+static constexpr auto COLOR_MAGENTA = "\x1b[35m";
+static constexpr auto COLOR_CYAN    = "\x1b[36m";
+
+static const char* color_or_empty(const char* code)
+{
+    return isatty(STDOUT_FILENO) ? code : "";
+}
 
 static void log_master(const std::string& s)
 {
@@ -58,16 +86,28 @@ static void log_master(const std::string& s)
     }
 }
 
+static double seconds_since_start()
+{
+    using namespace std::chrono;
+    return duration_cast<duration<double>>(steady_clock::now() - g_program_start).count();
+}
+
 static bool is_pid_alive(const pid_t pid)
 {
     return pid > 0 && ( kill(pid, 0) == 0 || errno == EPERM );
 }
 
-// Async signal safe handler, only sets atomics
 static void shutdown_signal_handler(const int signum)
 {
-    g_signal_number.store(signum);
+    g_signal_number.store(signum, std::memory_order_relaxed);
     g_signal_received.store(true);
+
+    g_shutdown_requested.store(true);
+
+    if (g_shm_sem && g_shm_sem != SEM_FAILED)
+    {
+        sem_post(g_shm_sem);
+    }
 }
 
 static std::string strip_leading_slash(const char* name)
@@ -164,7 +204,7 @@ static bool check_ipc_presence_and_report()
 static int mq_curmsgs_safe(const char* name)
 {
     const mqd_t mq = mq_open(name, O_RDONLY);
-    if (mq == (mqd_t)-1)
+    if (mq == ( mqd_t ) - 1)
     {
         return -1;
     }
@@ -243,6 +283,196 @@ static void terminate_service_graceful(pid_t& pid, const std::string& name)
     pid = -1;
 }
 
+static bool patient_slot_ready(pid_t pid)
+{
+    if (pid <= 0 || !g_ctrl_reg)
+    {
+        return false;
+    }
+
+    for (auto& slot : g_ctrl_reg->slots)
+    {
+        if (const pid_t owner = slot.pid.load(std::memory_order_acquire); owner == pid)
+        {
+            return slot.rdy.load(std::memory_order_acquire) != 0;
+        }
+    }
+    return false;
+}
+
+static void terminate_patients_graceful(std::vector<pid_t>& adult_patient_pids)
+{
+    std::vector<pid_t> pids_to_handle;
+    {
+        std::lock_guard lk(g_patient_mutex);
+        std::erase_if(adult_patient_pids, [](const pid_t p)
+        {
+            return !is_pid_alive(p);
+        });
+        pids_to_handle = adult_patient_pids;
+    }
+
+    if (pids_to_handle.empty())
+    {
+        log_master("terminate_patients_graceful: no active adult patients to terminate");
+        return;
+    }
+
+    const size_t n = pids_to_handle.size();
+    log_master("terminate_patients_graceful: will handle " + std::to_string(n) + " patients using parallel workers");
+
+    const unsigned hc          = std::thread::hardware_concurrency();
+    const size_t   max_workers = std::max<size_t>(1, hc ? hc : 4);
+    const size_t   workers     = std::min(max_workers, n);
+
+    {
+        std::atomic_size_t       idx{0};
+        std::vector<std::thread> pool;
+        pool.reserve(workers);
+
+        log_master("terminate_patients_graceful: phase1 - sending SIGUSR2 with " + std::to_string(workers) + " workers");
+
+        for (size_t w = 0; w < workers; ++w)
+        {
+            pool.emplace_back([&]()
+            {
+                while (true)
+                {
+                    const size_t i = idx.fetch_add(1, std::memory_order_relaxed);
+                    if (i >= n)
+                    {
+                        break;
+                    }
+
+                    const pid_t p = pids_to_handle[i];
+                    if (p <= 0)
+                    {
+                        continue;
+                    }
+
+                    if (!is_pid_alive(p))
+                    {
+                        log_master(std::string("terminate_patients_graceful: phase1 pid=") + std::to_string(p) + " already dead");
+                        continue;
+                    }
+
+                    if (kill(p, SIGUSR2) == -1)
+                    {
+                        log_master(std::string("terminate_patients_graceful: phase1 failed to send SIGUSR2 to pid=") + std::to_string(p) + " errno=" + std::to_string(errno));
+                    }
+                    else
+                    {
+                        log_master(std::string("terminate_patients_graceful: phase1 sent SIGUSR2 to pid=") + std::to_string(p));
+                    }
+                }
+            });
+        }
+
+        for (auto& t : pool)
+        {
+            if (t.joinable())
+            {
+                t.join();
+            }
+        }
+    }
+
+    // Short grace period
+    constexpr auto grace_ms = 200;
+    std::this_thread::sleep_for(std::chrono::milliseconds(grace_ms));
+
+    {
+        std::vector<pid_t> survivors;
+        survivors.reserve(n);
+        for (const pid_t p : pids_to_handle)
+        {
+            if (p <= 0)
+            {
+                continue;
+            }
+
+            if (is_pid_alive(p))
+            {
+                survivors.push_back(p);
+            }
+            else
+            {
+                log_master(std::string("terminate_patients_graceful: pid=") + std::to_string(p) + " exited after SIGUSR2");
+            }
+        }
+
+        if (!survivors.empty())
+        {
+            const size_t             m = survivors.size();
+            std::atomic_size_t       idx{0};
+            std::vector<std::thread> pool;
+            pool.reserve(std::min(workers, m));
+
+            log_master("terminate_patients_graceful: phase2 - ensuring termination of " + std::to_string(m) + " survivors with " + std::to_string(std::min(workers, m)) + " workers");
+
+            for (size_t w = 0; w < std::min(workers, m); ++w)
+            {
+                pool.emplace_back([&]()
+                {
+                    while (true)
+                    {
+                        const size_t i = idx.fetch_add(1, std::memory_order_relaxed);
+                        if (i >= m)
+                        {
+                            break;
+                        }
+
+                        const pid_t p = survivors[i];
+                        if (p <= 0)
+                        {
+                            continue;
+                        }
+
+                        if (!is_pid_alive(p))
+                        {
+                            log_master(std::string("terminate_patients_graceful: phase2 pid=") + std::to_string(p) + " already exited");
+                            continue;
+                        }
+
+                        pid_t local = p;
+                        terminate_service_graceful(local, "patient");
+                        if (!is_pid_alive(p))
+                        {
+                            log_master(std::string("terminate_patients_graceful: phase2 ensured termination of pid=") + std::to_string(p));
+                        }
+                        else
+                        {
+                            log_master(std::string("terminate_patients_graceful: phase2 still alive after terminate_service_graceful pid=") + std::to_string(p));
+                        }
+                    }
+                });
+            }
+
+            for (auto& t : pool)
+            {
+                if (t.joinable())
+                {
+                    t.join();
+                }
+            }
+        }
+        else
+        {
+            log_master("terminate_patients_graceful: phase2 - no survivors to handle");
+        }
+    }
+
+    {
+        std::lock_guard lk(g_patient_mutex);
+        for (pid_t p : pids_to_handle)
+        {
+            std::erase(adult_patient_pids, p);
+        }
+    }
+
+    log_master("terminate_patients_graceful: finished");
+}
+
 static void truncate_log_file(const std::string& path)
 {
     const int fd = open(path.c_str(), O_CREAT | O_TRUNC | O_WRONLY, IPC_MODE);
@@ -259,6 +489,7 @@ static void truncate_log_file(const std::string& path)
 static void cleanup()
 {
     log_master("cleanup: starting cleanup()");
+
     if (master_log)
     {
         fclose(master_log);
@@ -273,105 +504,85 @@ static void cleanup()
 
     if (g_shm)
     {
-        if (munmap(g_shm, sizeof(ERShared)) == -1)
-        {
-            perror("munmap");
-        }
+        munmap(g_shm, sizeof(ERShared));
         g_shm = nullptr;
     }
 
     if (g_shm_fd != -1)
     {
-        if (close(g_shm_fd) == -1)
-        {
-            perror("close(g_shm_fd)");
-        }
-
-        if (shm_unlink(SHM_NAME) == -1)
-        {
-            if (errno != ENOENT)
-            {
-                perror("shm_unlink");
-            }
-            else
-            {
-                log_master("cleanup: shm_unlink returned ENOENT");
-            }
-        }
-
+        close(g_shm_fd);
+        shm_unlink(SHM_NAME);
         g_shm_fd = -1;
     }
 
     if (g_shm_sem)
     {
-        if (sem_close(g_shm_sem) == -1)
-        {
-            perror("sem_close");
-        }
-
-        if (sem_unlink(SEM_SHM_NAME) == -1)
-        {
-            if (errno != ENOENT)
-            {
-                perror("sem_unlink");
-            }
-            else
-            {
-                log_master("cleanup: sem_unlink returned ENOENT");
-            }
-        }
-
+        sem_close(g_shm_sem);
+        sem_unlink(SEM_SHM_NAME);
         g_shm_sem = nullptr;
     }
 
-    if (mq_unlink(MQ_REG_NAME) == -1 && errno != ENOENT)
+    mq_unlink(MQ_REG_NAME);
+    mq_unlink(MQ_TRIAGE_NAME);
+    mq_unlink(MQ_DOCTOR_NAME);
+
+    if (mq_unlink(MQ_PATIENT_CTRL) == -1 && errno != ENOENT)
     {
-        perror("mq_unlink reg");
+        perror("mq_unlink patient_ctrl");
     }
     else
     {
-        log_master("cleanup: mq_unlink registration attempted");
+        log_master("cleanup: mq_unlink patient_ctrl attempted");
     }
 
-    if (mq_unlink(MQ_TRIAGE_NAME) == -1 && errno != ENOENT)
+    if (g_dispatcher_pid > 0)
     {
-        perror("mq_unlink triage");
-    }
-    else
-    {
-        log_master("cleanup: mq_unlink triage attempted");
+        terminate_service_graceful(g_dispatcher_pid, "control_dispatcher");
+        g_dispatcher_pid = -1;
     }
 
-    if (mq_unlink(MQ_DOCTOR_NAME) == -1 && errno != ENOENT)
+    // Unlink named semaphores for control registry
+    for (size_t i = 0; i < CTRL_SEM_BUCKETS; ++i)
     {
-        perror("mq_unlink doctor");
+        const std::string sname = ctrl_sem_name(i);
+        if (sem_unlink(sname.c_str()) == -1 && errno != ENOENT)
+        {
+            perror(( "sem_unlink " + sname ).c_str());
+        }
+        else
+        {
+            log_master("cleanup: sem_unlink attempted for " + sname);
+        }
     }
-    else
+
+    // Unmap extended shared memory region (ERShared + ControlRegistry)
+    if (g_shm)
     {
-        log_master("cleanup: mq_unlink doctor attempted");
+        munmap(g_shm, g_total_shm_sz);
+        g_shm = nullptr;
+    }
+
+    if (g_shm_fd != -1)
+    {
+        close(g_shm_fd);
+        shm_unlink(SHM_NAME);
+        g_shm_fd = -1;
     }
 
     log_master("cleanup: finished cleanup()");
 }
 
-// SIGUSR2 => set evacuation flag in shared memory
 static void sigusr2_handler(int)
 {
-    if (g_shm && g_shm_sem)
+    g_signal_number.store(SIGUSR2, std::memory_order_relaxed);
+    g_signal_received.store(true);
+
+    g_shutdown_requested.store(true);
+
+    if (g_shm_sem && g_shm_sem != SEM_FAILED)
     {
-        if (sem_wait(g_shm_sem) == -1)
-        {
-            perror("sem_wait");
-        }
-
-        g_shm->evacuation = true;
-        if (sem_post(g_shm_sem) == -1)
-        {
-            perror("sem_post");
-        }
+        sem_post(g_shm_sem);
     }
-
-    log_master("SIGUSR2 received by master: evacuation flag set in shared memory.");
 }
 
 // Spawn process helper (fork + exec)
@@ -407,10 +618,64 @@ static pid_t spawn_process(const std::string& path, const std::vector<std::strin
     return pid;
 }
 
+static pid_t spawn_process_limited(const std::string& path, const std::vector<std::string>& args)
+{
+    using clock = std::chrono::steady_clock;
+
+    thread_local auto last_spawn = clock::now();
+
+    while (!g_shutdown_requested.load())
+    {
+        const int cur = g_current_processes.load(std::memory_order_relaxed);
+
+        if (cur >= MAX_CONCURRENT_PROCESSES)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            continue;
+        }
+
+        const double pressure = static_cast<double>(cur) / static_cast<double>(MAX_CONCURRENT_PROCESSES);
+
+        double delay_ms = 0.0;
+        if (constexpr double PRESSURE_START = 0.40; pressure > PRESSURE_START)
+        {
+            constexpr double MAX_DELAY_MS = 1200.0;
+            const double     x            = ( pressure - PRESSURE_START ) / ( 1.0 - PRESSURE_START ); // normalize → [0,1]
+
+            delay_ms = x * x * x * MAX_DELAY_MS;
+        }
+
+        if (const auto now = clock::now(); delay_ms > 0 && now - last_spawn < std::chrono::milliseconds(static_cast<int>(delay_ms)))
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            continue;
+        }
+
+
+        if (int expected = cur; !g_current_processes.compare_exchange_weak(expected, cur + 1, std::memory_order_acq_rel))
+        {
+            continue;
+        }
+
+        const pid_t pid = spawn_process(path, args);
+        if (pid <= 0)
+        {
+            g_current_processes.fetch_sub(1, std::memory_order_release);
+            return -1;
+        }
+
+        last_spawn = clock::now();
+        return pid;
+    }
+
+    return -1;
+}
+
 // Create message queues and shared resources
 static bool setup_ipc()
 {
     log_master("setup_ipc: creating message queues and shared memory");
+
     mq_attr attr{};
     attr.mq_flags   = 0;
     attr.mq_maxmsg  = MAX_QUEUE_MESSAGES;
@@ -418,7 +683,7 @@ static bool setup_ipc()
     attr.mq_curmsgs = 0;
 
     mqd_t mqd = mq_open(MQ_REG_NAME, O_CREAT | O_RDWR, IPC_MODE, &attr);
-    if (mqd == (mqd_t)-1)
+    if (mqd == ( mqd_t ) - 1)
     {
         perror("mq_open reg");
         log_master(std::string("setup_ipc: mq_open reg failed: ") + strerror(errno));
@@ -428,7 +693,7 @@ static bool setup_ipc()
     log_master("setup_ipc: registration MQ created/validated");
 
     mqd = mq_open(MQ_TRIAGE_NAME, O_CREAT | O_RDWR, IPC_MODE, &attr);
-    if (mqd == (mqd_t)-1)
+    if (mqd == ( mqd_t ) - 1)
     {
         perror("mq_open triage");
         log_master(std::string("setup_ipc: mq_open triage failed: ") + strerror(errno));
@@ -438,7 +703,7 @@ static bool setup_ipc()
     log_master("setup_ipc: triage MQ created/validated");
 
     mqd = mq_open(MQ_DOCTOR_NAME, O_CREAT | O_RDWR, IPC_MODE, &attr);
-    if (mqd == (mqd_t)-1)
+    if (mqd == ( mqd_t ) - 1)
     {
         perror("mq_open doctor");
         log_master(std::string("setup_ipc: mq_open doctor failed: ") + strerror(errno));
@@ -447,31 +712,53 @@ static bool setup_ipc()
     mq_close(mqd);
     log_master("setup_ipc: doctor MQ created/validated");
 
+    mq_attr ctrl_attr{};
+    ctrl_attr.mq_flags   = 0;
+    ctrl_attr.mq_maxmsg  = 1024;
+    ctrl_attr.mq_msgsize = sizeof(ControlMessage);
+    ctrl_attr.mq_curmsgs = 0;
+
+    mqd = mq_open(MQ_PATIENT_CTRL, O_CREAT | O_RDWR | O_CLOEXEC, IPC_MODE, &ctrl_attr);
+
+    if (mqd == ( mqd_t ) - 1)
+    {
+        perror("mq_open patient_ctrl");
+        log_master(std::string("setup_ipc: mq_open patient_ctrl failed: ") + strerror(errno));
+        return false;
+    }
+    mq_close(mqd);
+    log_master("setup_ipc: shared patient control MQ created/validated");
+
+    // Compute total shm size to hold ERShared + ControlRegistry
+    constexpr int total_shm = sizeof(ERShared) + sizeof(ControlRegistry);
+    g_total_shm_sz          = total_shm;
+
     g_shm_fd = shm_open(SHM_NAME, O_CREAT | O_RDWR, IPC_MODE);
     if (g_shm_fd == -1)
     {
         perror("shm_open");
-        log_master(std::string("setup_ipc: shm_open failed: ") + strerror(errno));
         return false;
     }
-    log_master("setup_ipc: shm_open succeeded fd=" + std::to_string(g_shm_fd));
 
-    if (ftruncate(g_shm_fd, sizeof(ERShared)) == -1)
+    if (ftruncate(g_shm_fd, total_shm) == -1)
     {
         perror("ftruncate");
-        log_master(std::string("setup_ipc: ftruncate failed: ") + strerror(errno));
         return false;
     }
 
-    g_shm = static_cast<ERShared*>(mmap(nullptr, sizeof(ERShared), PROT_READ | PROT_WRITE, MAP_SHARED, g_shm_fd, 0));
-    if (g_shm == MAP_FAILED)
+    // Map the whole region (ERShared at start, ControlRegistry immediately after)
+    void* p = mmap(nullptr, total_shm, PROT_READ | PROT_WRITE, MAP_SHARED, g_shm_fd, 0);
+    if (p == MAP_FAILED)
     {
         perror("mmap");
-        log_master(std::string("setup_ipc: mmap failed: ") + strerror(errno));
         return false;
     }
-    log_master("setup_ipc: mmap succeeded");
 
+    // Assign pointers
+    g_shm      = static_cast<ERShared*>(p);
+    g_ctrl_reg = reinterpret_cast<ControlRegistry*>(static_cast<char*>(p) + sizeof(ERShared));
+
+    // Init ERShared values
     g_shm->N_waiting_room      = g_N;
     g_shm->current_inside      = 0;
     g_shm->waiting_to_register = 0;
@@ -479,21 +766,59 @@ static bool setup_ipc()
     g_shm->second_reg_open     = false;
     g_shm->evacuation          = false;
 
+    // Initialize control registry (zero it)
+    std::memset(g_ctrl_reg, 0, sizeof(ControlRegistry));
+    g_ctrl_reg->initialized = 1;
+    g_ctrl_reg->alloc_cursor.store(0);
+
+    // create bucket semaphores (named) for control registry
+    for (size_t i = 0; i < CTRL_SEM_BUCKETS; ++i)
+    {
+        const std::string sname = ctrl_sem_name(i);
+        if (sem_t* sem = sem_open(sname.c_str(), O_CREAT | O_EXCL, IPC_MODE, 0); sem == SEM_FAILED)
+        {
+            if (errno == EEXIST)
+            {
+                // already exists; open it
+                sem = sem_open(sname.c_str(), 0);
+                if (sem == SEM_FAILED)
+                {
+                    perror(( "sem_open existing " + sname ).c_str());
+                    // continue: dispatcher/patients can still create/open later
+                }
+                else
+                {
+                    sem_close(sem);
+                }
+            }
+            else
+            {
+                perror(( "sem_open " + sname ).c_str());
+            }
+        }
+        else
+        {
+            // close handle, we only need it to exist
+            sem_close(sem);
+        }
+    }
+
+    // Create shared shm semaphore
     g_shm_sem = sem_open(SEM_SHM_NAME, O_CREAT, IPC_MODE, 1);
     if (g_shm_sem == SEM_FAILED)
     {
         perror("sem_open");
-        log_master(std::string("setup_ipc: sem_open failed: ") + strerror(errno));
         return false;
     }
-    log_master("setup_ipc: semaphore opened");
 
+    log_master("setup_ipc: ERShared + ControlRegistry created and bucket semaphores initialized");
     return true;
 }
 
+
 // Attempt to send a spawn-child control message to an adult patient (by pid)
 // True if send succeeded
-static bool send_spawn_child_to_patient(const pid_t target_pid, const ControlMessage& cm)
+static bool send_spawn_child_to_patient(const pid_t target_pid, ControlMessage cm)
 {
     if (target_pid <= 0)
     {
@@ -503,35 +828,35 @@ static bool send_spawn_child_to_patient(const pid_t target_pid, const ControlMes
 
     if (!is_pid_alive(target_pid))
     {
-        log_master("send_spawn_child_to_patient: target pid " + std::to_string(target_pid) + " not alive (skipping)");
+        log_master("send_spawn_child_to_patient: target pid " + std::to_string(target_pid) + " not alive");
         return false;
     }
 
-    char mqname[256];
-    snprintf(mqname, sizeof( mqname ), "%s%u", PATIENT_CTRL_MQ_PREFIX, static_cast<unsigned>(target_pid));
-    log_master(std::string("send_spawn_child_to_patient: attempting to open mq ") + mqname);
-    const mqd_t mq = mq_open(mqname, O_WRONLY);
-    if (mq == (mqd_t)-1)
+    cm.target_pid = static_cast<int>(target_pid);
+
+    const mqd_t mq = mq_open(MQ_PATIENT_CTRL, O_WRONLY | O_CLOEXEC);
+
+    if (mq == ( mqd_t ) - 1)
     {
-        // if queue doesn't exist yet or target died
-        log_master(std::string("send_spawn_child_to_patient: mq_open failed for ") + mqname + " : " + strerror(errno));
+        log_master("send_spawn_child_to_patient: mq_open(MQ_PATIENT_CTRL) failed: " + std::string(strerror(errno)));
         return false;
     }
-    log_master(std::string("send_spawn_child_to_patient: mq_open succeeded for ") + mqname);
 
     if (mq_send(mq, reinterpret_cast<const char*>(&cm), sizeof( cm ), 0) == -1)
     {
-        perror("mq_send to patient ctrl");
-        log_master(std::string("send_spawn_child_to_patient: mq_send failed: ") + strerror(errno));
+        perror("mq_send patient_ctrl");
         mq_close(mq);
         return false;
     }
 
     mq_close(mq);
-    log_master("send_spawn_child_to_patient: mq_send succeeded for child_id=" + std::to_string(cm.child_id) + " on pid=" + std::to_string(target_pid));
+    log_master("send_spawn_child_to_patient: sent CTRL_SPAWN_CHILD id=" + std::to_string(cm.child_id) + " to target pid=" + std::to_string(target_pid));
+
+    g_spawned_children.fetch_add(1, std::memory_order_relaxed);
 
     return true;
 }
+
 
 // Send SIGUSR2 to all services (registration windows, triage, doctors)
 static void signal_all_services(const pid_t reg1, const pid_t reg2, const pid_t triage, const std::vector<pid_t>& doctors)
@@ -548,7 +873,7 @@ static void signal_all_services(const pid_t reg1, const pid_t reg2, const pid_t 
             {
                 std::ostringstream oss;
                 oss << "Sent signal " << sig << " to pid=" << pid << " (" << name << ")";
-                std::cout << oss.str() << std::endl;
+                std::cout << color_or_empty(COLOR_YELLOW) << oss.str() << color_or_empty(COLOR_RESET) << std::endl;
             }
         }
     };
@@ -573,6 +898,12 @@ static void input_thread_fn(std::atomic_bool& stop_flag, pid_t& reg1_pid, pid_t&
 {
     int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
     fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
+
+    if (setpriority(PRIO_PROCESS, 0, -20) == -1)
+    {
+        perror("setpriority");
+        log_master("input_thread/add: failed to increase priority");
+    }
 
     log_master("input_thread: started");
     std::default_random_engine rng(static_cast<unsigned>(time(nullptr)) ^ pthread_self());
@@ -643,7 +974,11 @@ static void input_thread_fn(std::atomic_bool& stop_flag, pid_t& reg1_pid, pid_t&
 
             if (cmd == "help")
             {
+                const char* G = color_or_empty(COLOR_GREEN);
+                const char* R = color_or_empty(COLOR_RESET);
+                std::cout << G;
                 std::cout << "Supported commands:\n" << "  help                     - show this help\n" << "  signal <SIG...> [pid]    - send a POSIX signal (e.g. SIGUSR2)\n" << "  list                     - show simulation status and queue lengths\n" << "  add N                    - add N new patients now\n" << "  quit | shutdown | exit   - request shutdown\n";
+                std::cout << R;
                 log_master("input_thread: help requested");
             }
             else if (cmd == "doctor")
@@ -783,8 +1118,10 @@ static void input_thread_fn(std::atomic_bool& stop_flag, pid_t& reg1_pid, pid_t&
                         }
                         else
                         {
-                            if (pid_t pid = spawn_process("./patient", {std::to_string(my_id), std::to_string(age), is_vip ? "1" : "0"}); pid > 0)
+                            if (pid_t pid = spawn_process_limited("./patient", {std::to_string(my_id), std::to_string(age), is_vip ? "1" : "0"}); pid > 0)
                             {
+                                g_spawned_adults.fetch_add(1, std::memory_order_relaxed);
+
                                 {
                                     std::lock_guard lk(g_patient_mutex);
                                     adult_patient_pids.push_back(pid);
@@ -815,6 +1152,237 @@ static void input_thread_fn(std::atomic_bool& stop_flag, pid_t& reg1_pid, pid_t&
 
                     log_master("add_thread: finished spawning " + std::to_string(N) + " patients");
                 }).detach();
+            }
+            else if (cmd == "periodic")
+            {
+                std::string token;
+                if (!( iss >> token ))
+                {
+                    std::cout << "Usage:\n  periodic N X      - spawn N patients, one every X milliseconds\n  periodic RANDOM   - spawn up to 10000 patients at random intervals 300..1000 ms\n";
+                    continue;
+                }
+
+                // Numeric mode: periodic N X
+                if (token != "RANDOM" && token != "random")
+                {
+                    int N = 0;
+                    try
+                    {
+                        N = std::stoi(token);
+                    }
+                    catch (...)
+                    {
+                        N = 0;
+                    }
+
+                    int X = 0;
+                    if (!( iss >> X ) || N <= 0 || X < 0)
+                    {
+                        std::cout << "Usage: periodic N X   (N positive, X interval in ms)\n";
+                        continue;
+                    }
+
+                    log_master("input_thread: periodic requested N=" + std::to_string(N) + " X_ms=" + std::to_string(X));
+
+                    // Detached thread that will perform the N spawns
+                    std::thread([N, X, &next_id, &adult_patient_pids, &pending_children]()
+                    {
+                        if (setpriority(PRIO_PROCESS, 0, -20) == -1)
+                        {
+                            perror("setpriority");
+                            log_master("periodic: failed to increase priority of periodic spawner");
+                        }
+
+                        std::default_random_engine local_rng(static_cast<unsigned>(time(nullptr)) ^ std::hash<std::thread::id>{}(std::this_thread::get_id()));
+
+                        for (int i = 0; i < N && !g_shutdown_requested.load(); ++i)
+                        {
+                            int  age      = local_rng() % 80 + 1 + ADULTS_ONLY;
+                            bool is_child = age < 18;
+                            bool is_vip   = local_rng() % 100 < 5;
+                            int  my_id    = next_id.fetch_add(1);
+
+                            if (is_child)
+                            {
+                                ControlMessage cm{};
+                                cm.cmd       = CTRL_SPAWN_CHILD;
+                                cm.child_id  = my_id;
+                                cm.child_age = age;
+                                cm.child_vip = is_vip;
+                                strncpy(cm.symptoms, "child symptoms", sizeof( cm.symptoms ) - 1);
+                                cm.symptoms[sizeof( cm.symptoms ) - 1] = '\0';
+
+                                {
+                                    bool            dispatched = false;
+                                    std::lock_guard lk(g_patient_mutex);
+                                    std::erase_if(adult_patient_pids, [](const pid_t p)
+                                    {
+                                        return !is_pid_alive(p);
+                                    });
+
+                                    if (!adult_patient_pids.empty())
+                                    {
+                                        std::uniform_int_distribution<size_t> di(0, adult_patient_pids.size() - 1);
+                                        size_t                                tries = adult_patient_pids.size();
+                                        while (tries--)
+                                        {
+                                            size_t idx = di(local_rng);
+                                            if (pid_t target = adult_patient_pids[idx]; send_spawn_child_to_patient(target, cm))
+                                            {
+                                                dispatched = true;
+                                                break;
+                                            }
+                                        }
+                                    }
+
+                                    if (!dispatched)
+                                    {
+                                        pending_children.push_back(cm);
+                                    }
+                                }
+
+                                std::ostringstream out;
+                                out << "periodic: created patient id=" << my_id << " age=" << age << " type=child" << ( is_vip ? " VIP" : "" );
+                                std::cout << out.str() << '\n';
+                                log_master(out.str());
+                            }
+                            else
+                            {
+                                if (pid_t pid = spawn_process_limited("./patient", {std::to_string(my_id), std::to_string(age), is_vip ? "1" : "0"}); pid > 0)
+                                {
+                                    g_spawned_adults.fetch_add(1, std::memory_order_relaxed);
+
+                                    {
+                                        std::lock_guard lk(g_patient_mutex);
+                                        adult_patient_pids.push_back(pid);
+                                    }
+
+                                    std::ostringstream out;
+                                    out << "periodic: forked adult patient pid=" << pid << " id=" << my_id << ( is_vip ? " VIP" : "" );
+                                    std::cout << out.str() << '\n';
+                                    log_master(out.str());
+                                }
+                                else
+                                {
+                                    std::ostringstream out;
+                                    out << "periodic: failed to fork adult patient id=" << my_id;
+                                    std::cout << out.str() << '\n';
+                                    log_master(out.str());
+                                }
+                            }
+
+                            // sleep X milliseconds but remain responsive to shutdown
+                            for (int slept = 0; slept < X && !g_shutdown_requested.load(); slept += 50)
+                            {
+                                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                            }
+                        }
+
+                        log_master("periodic: finished numeric periodic spawn N=" + std::to_string(N));
+                    }).detach();
+                }
+                else // RANDOM mode
+                {
+                    constexpr int maxN = 15000;
+                    log_master("input_thread: periodic RANDOM requested up to " + std::to_string(maxN) + " patients (300..1000 ms)");
+
+                    std::thread([&next_id, &adult_patient_pids, &pending_children]()
+                    {
+                        if (setpriority(PRIO_PROCESS, 0, -20) == -1)
+                        {
+                            perror("setpriority");
+                            log_master("periodic RANDOM: failed to increase priority of periodic spawner");
+                        }
+
+                        std::default_random_engine         local_rng(static_cast<unsigned>(time(nullptr)) ^ std::hash<std::thread::id>{}(std::this_thread::get_id()));
+                        std::uniform_int_distribution<int> delay_ms(300, 1000);
+
+                        for (int i = 0; i < maxN && !g_shutdown_requested.load(); ++i)
+                        {
+                            int  age      = local_rng() % 80 + 1 + ADULTS_ONLY;
+                            bool is_child = age < 18;
+                            bool is_vip   = local_rng() % 100 < 5;
+                            int  my_id    = next_id.fetch_add(1);
+
+                            if (is_child)
+                            {
+                                ControlMessage cm{};
+                                cm.cmd       = CTRL_SPAWN_CHILD;
+                                cm.child_id  = my_id;
+                                cm.child_age = age;
+                                cm.child_vip = is_vip;
+                                strncpy(cm.symptoms, "child symptoms", sizeof( cm.symptoms ) - 1);
+                                cm.symptoms[sizeof( cm.symptoms ) - 1] = '\0';
+
+                                bool dispatched = false;
+                                {
+                                    std::lock_guard lk(g_patient_mutex);
+                                    std::erase_if(adult_patient_pids, [](const pid_t p)
+                                    {
+                                        return !is_pid_alive(p);
+                                    });
+
+                                    if (!adult_patient_pids.empty())
+                                    {
+                                        std::uniform_int_distribution<size_t> di(0, adult_patient_pids.size() - 1);
+                                        size_t                                tries = adult_patient_pids.size();
+                                        while (tries--)
+                                        {
+                                            size_t idx = di(local_rng);
+                                            if (pid_t target = adult_patient_pids[idx]; send_spawn_child_to_patient(target, cm))
+                                            {
+                                                dispatched = true;
+                                                break;
+                                            }
+                                        }
+                                    }
+
+                                    if (!dispatched)
+                                    {
+                                        pending_children.push_back(cm);
+                                    }
+                                }
+
+                                std::ostringstream out;
+                                out << "periodic RANDOM: created patient id=" << my_id << " age=" << age << " type=child" << ( is_vip ? " VIP" : "" );
+                                std::cout << out.str() << '\n';
+                                log_master(out.str());
+                            }
+                            else
+                            {
+                                if (pid_t pid = spawn_process_limited("./patient", {std::to_string(my_id), std::to_string(age), is_vip ? "1" : "0"}); pid > 0)
+                                {
+                                    g_spawned_adults.fetch_add(1, std::memory_order_relaxed);
+
+                                    {
+                                        std::lock_guard lk(g_patient_mutex);
+                                        adult_patient_pids.push_back(pid);
+                                    }
+
+                                    std::ostringstream out;
+                                    out << "p" "eriodic RANDOM: forked adult patient pid=" << pid << " id=" << my_id << ( is_vip ? " VIP" : "" );
+                                    std::cout << out.str() << '\n';
+                                    log_master(out.str());
+                                }
+                                else
+                                {
+                                    std::ostringstream out;
+                                    out << "periodic RANDOM: failed to fork adult patient id=" << my_id;
+                                    std::cout << out.str() << '\n';
+                                    log_master(out.str());
+                                }
+                            }
+
+                            int wait = delay_ms(local_rng);
+                            for (int slept = 0; slept < wait && !g_shutdown_requested.load(); slept += 50)
+                            {
+                                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                            }
+                        }
+
+                        log_master("periodic RANDOM: finished (max=" + std::to_string(maxN) + ")");
+                    }).detach();
+                }
             }
             else if (cmd == "signal" || cmd == "sig")
             {
@@ -878,7 +1446,7 @@ static void input_thread_fn(std::atomic_bool& stop_flag, pid_t& reg1_pid, pid_t&
 
                     if (do_send)
                     {
-                        signal_all_services(reg1_pid, reg2_pid, triage_pid, doctor_pids);
+                        //signal_all_services(reg1_pid, reg2_pid, triage_pid, doctor_pids);
                         if (g_shm && g_shm_sem)
                         {
                             sem_wait(g_shm_sem);
@@ -905,6 +1473,19 @@ static void input_thread_fn(std::atomic_bool& stop_flag, pid_t& reg1_pid, pid_t&
             }
             else if (cmd == "list")
             {
+                const char* B = color_or_empty(COLOR_BLUE);
+                const char* R = color_or_empty(COLOR_RESET);
+
+                const double elapsed = seconds_since_start();
+
+                const long adults   = g_spawned_adults.load(std::memory_order_relaxed);
+                const long children = g_spawned_children.load(std::memory_order_relaxed);
+                const long total    = adults + children;
+
+                const double adult_rate = elapsed > 0 ? adults / elapsed : 0.0;
+                const double child_rate = elapsed > 0 ? children / elapsed : 0.0;
+                const double total_rate = elapsed > 0 ? total / elapsed : 0.0;
+
                 int reg_q    = mq_curmsgs_safe(MQ_REG_NAME);
                 int triage_q = mq_curmsgs_safe(MQ_TRIAGE_NAME);
                 int doc_q    = mq_curmsgs_safe(MQ_DOCTOR_NAME);
@@ -925,6 +1506,8 @@ static void input_thread_fn(std::atomic_bool& stop_flag, pid_t& reg1_pid, pid_t&
                     adults_snapshot = adult_patient_pids.size();
                 }
 
+                std::cout << B;
+
                 std::cout << "--- simulation status ---\n";
                 std::cout << "registration #1 pid=" << reg1_pid << "\n";
                 std::cout << "registration #2 pid=" << reg2_pid << "\n";
@@ -942,12 +1525,31 @@ static void input_thread_fn(std::atomic_bool& stop_flag, pid_t& reg1_pid, pid_t&
                 std::cout << "triage MQ messages: " << ( triage_q >= 0 ? std::to_string(triage_q) : "err" ) << "\n";
                 std::cout << "doctor MQ messages: " << ( doc_q >= 0 ? std::to_string(doc_q) : "err" ) << "\n";
                 std::cout << "pending children (master queue): " << pending_children.size() << "\n";
-                std::cout << "total treated (shared): " << treated << "\n";
+                std::cout << "total processed (shared): " << treated << "\n";
+
+                std::cout << "uptime: " << std::fixed << std::setprecision(2) << elapsed << " s\n";
+
+                // std::cout << "spawned adults: " << adults << " (avg " << adult_rate << " /s)\n";
+                //
+                // if constexpr (ADULTS_ONLY == 0)
+                // {
+                //     std::cout << "spawned children: " << children << " (avg " << child_rate << " /s)\n";
+                // }
+
+                std::cout << "total spawned: " << total << " (avg " << total_rate << " /s)\n";
+
+                std::cout << R;
+
                 log_master("input_thread: list command executed");
             }
             else if (cmd == "quit" || cmd == "shutdown" || cmd == "exit")
             {
+                const char* B = color_or_empty(COLOR_RED);
+                const char* R = color_or_empty(COLOR_RESET);
+
+                std::cout << B;
                 std::cout << "Interactive requested shutdown\n";
+                std::cout << R;
 
                 if (bool expected = false; g_shutdown_requested.compare_exchange_strong(expected, true))
                 {
@@ -958,7 +1560,6 @@ static void input_thread_fn(std::atomic_bool& stop_flag, pid_t& reg1_pid, pid_t&
                         sem_post(g_shm_sem);
                     }
 
-                    signal_all_services(reg1_pid, reg2_pid, triage_pid, doctor_pids);
                     log_master("input_thread: interactive shutdown requested");
 
                     // Drain any remaining stdin so duplicate text won't be re-processed
@@ -972,7 +1573,7 @@ static void input_thread_fn(std::atomic_bool& stop_flag, pid_t& reg1_pid, pid_t&
                     std::cout << "Shutdown already requested\n";
                 }
 
-                stop_flag = true; // Tell caller thread we're done
+                stop_flag = true;
                 log_master("input_thread: exiting after shutdown request");
                 return;
             }
@@ -995,7 +1596,12 @@ int main(int argc, char** argv)
 {
     if constexpr (!LOGGING)
     {
+        const char* G = color_or_empty(COLOR_RED);
+        const char* R = color_or_empty(COLOR_RESET);
+
+        std::cout << G;
         std::cout << "Logging is disabled" << '\n';
+        std::cout << R;
     }
 
     if (argc < 4)
@@ -1020,10 +1626,11 @@ int main(int argc, char** argv)
     }
 
     truncate_log_file("../../logs/master.log");
-    truncate_log_file("../../logs/patients.log");
-    truncate_log_file("../../logs/registration.log");
     truncate_log_file("../../logs/triage.log");
     truncate_log_file("../../logs/doctor.log");
+    truncate_log_file("../../logs/patients.log");
+    truncate_log_file("../../logs/dispatcher.log");
+    truncate_log_file("../../logs/registration.log");
 
     int mfd = open("../../logs/master.log", O_CREAT | O_WRONLY | O_APPEND, IPC_MODE);
     if (mfd == -1)
@@ -1090,6 +1697,16 @@ int main(int argc, char** argv)
     pid_t reg1_pid   = spawn_process("./registration", {"1"});
     pid_t reg2_pid   = -1;
 
+    g_dispatcher_pid = spawn_process("./dispatcher", {});
+    if (g_dispatcher_pid > 0)
+    {
+        log_master("Spawned control_dispatcher pid=" + std::to_string(g_dispatcher_pid));
+    }
+    else
+    {
+        log_master("Failed to spawn control_dispatcher");
+    }
+
     std::vector<pid_t> doctor_pids;
     for (int i = 0; i < num_doctors; i++)
     {
@@ -1109,7 +1726,8 @@ int main(int argc, char** argv)
 
     // Spawn initial patients in BACKGROUND thread to avoid blocking monitor/services
     std::atomic_bool spawn_done{false};
-    std::thread      spawn_thread([&]
+
+    std::thread spawn_thread([&]
     {
         if (setpriority(PRIO_PROCESS, 0, -20) == -1)
         {
@@ -1122,7 +1740,7 @@ int main(int argc, char** argv)
 
         for (int i = 0; i < num_patients && !g_shutdown_requested.load(); i++)
         {
-            int  age      = rng() % 80 + 1;
+            int  age      = rng() % 80 + 1 + ADULTS_ONLY;
             bool is_child = age < 18;
             bool is_vip   = rng() % 100 < 5;
 
@@ -1174,8 +1792,10 @@ int main(int argc, char** argv)
             }
             else
             {
-                if (pid_t pid = spawn_process("./patient", {std::to_string(my_id), std::to_string(age), is_vip ? "1" : "0"}); pid > 0)
+                if (pid_t pid = spawn_process_limited("./patient", {std::to_string(my_id), std::to_string(age), is_vip ? "1" : "0"}); pid > 0)
                 {
+                    g_spawned_adults.fetch_add(1, std::memory_order_relaxed);
+
                     {
                         std::lock_guard lk(g_patient_mutex);
                         adult_patient_pids.push_back(pid);
@@ -1194,8 +1814,6 @@ int main(int argc, char** argv)
                     log_master(out.str());
                 }
             }
-
-            // std::this_thread::sleep_for(std::chrono::microseconds(50));
         }
 
         spawn_done.store(true);
@@ -1241,7 +1859,7 @@ int main(int argc, char** argv)
 
             if (do_send)
             {
-                signal_all_services(reg1_pid, reg2_pid, triage_pid, doctor_pids);
+                // signal_all_services(reg1_pid, reg2_pid, triage_pid, doctor_pids);
             }
 
             // Clear the flag so it's no rehandled
@@ -1264,14 +1882,14 @@ int main(int argc, char** argv)
                 if (g_shm_sem && sem_wait(g_shm_sem) != -1)
                 {
                     if (g_shm)
+                    {
                         g_shm->evacuation = true;
+                    }
                     if (sem_post(g_shm_sem) == -1)
+                    {
                         perror("sem_post");
+                    }
                 }
-
-                // Broadcast to services
-                signal_all_services(reg1_pid, reg2_pid, triage_pid, doctor_pids);
-                // Set g_shutdown_requested already done by compare_exchange above
             }
         }
 
@@ -1338,7 +1956,6 @@ int main(int argc, char** argv)
                 log_master("Attempted to open second registration window but spawn failed.");
             }
         }
-
         else if (second_open && waiting < g_N / 3 && reg_q <= 0)
         {
             log_master("monitor: deciding to close second registration (waiting < N/3 and reg MQ empty)");
@@ -1395,6 +2012,13 @@ int main(int argc, char** argv)
                     }
                 }
 
+                {
+                    if (int prev = g_current_processes.fetch_sub(1); prev <= 0)
+                    {
+                        g_current_processes.fetch_add(1);
+                    }
+                }
+
                 if (doctor_handled)
                 {
                     continue;
@@ -1444,7 +2068,7 @@ int main(int argc, char** argv)
                     }
                     else
                     {
-                        ++it;
+                        it++;
                     }
                 }
             }
@@ -1488,6 +2112,8 @@ int main(int argc, char** argv)
 
     log_master("main: shutting down - final shutdown signal wave, for safety");
     signal_all_services(reg1_pid, reg2_pid, triage_pid, doctor_pids);
+
+    terminate_patients_graceful(adult_patient_pids);
 
     if (reg2_pid > 0)
     {

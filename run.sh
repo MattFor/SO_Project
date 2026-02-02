@@ -75,7 +75,24 @@ BIN_DIR="${BUILD_DIR}/bin"
 
 WAITING_ROOM_SIZE=1000
 DOCTORS=10
-PATIENTS=100
+PATIENTS=10000000
+
+raise_realtime_limits() {
+    log "REALTIME: Raising hard resource limits (best-effort)"
+
+    ulimit -n 1048576  || log "REALTIME: failed to raise open files (ulimit -n)"
+    ulimit -u unlimited || log "REALTIME: failed to raise process limit (ulimit -u)"
+    ulimit -s unlimited || log "REALTIME: failed to raise stack size (ulimit -s)"
+    ulimit -c unlimited || log "REALTIME: failed to enable core dumps (ulimit -c)"
+
+    sysctl -w kernel.pid_max=4194303        || log "REALTIME: pid_max not changed"
+    sysctl -w kernel.threads-max=4194303    || log "REALTIME: threads-max not changed"
+
+    sysctl -w fs.mqueue.msg_max=16384       || log "REALTIME: mqueue msg_max not changed"
+    sysctl -w fs.mqueue.queues_max=2048     || log "REALTIME: mqueue queues_max not changed"
+
+    sysctl -w kernel.sched_migration_cost_ns=5000000 || true
+}
 
 log() { printf "[%s] %s\n" "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
 die() { echo "ERROR: $*" >&2; exit 1; }
@@ -90,15 +107,22 @@ pkill -f "./registration" || true
 pkill -f "./triage" || true
 pkill -f "./doctor" || true
 pkill -f "./patient" || true
+pkill -f "./dispatcher" || true
 
 log "Cleaning POSIX message queues and shared memory"
 [[ -d /dev/mqueue ]] && rm -f /dev/mqueue/er_* || true
 rm -f /dev/shm/er_* || true
 
-log "Raising resource limits (open files, processes, stack)"
+log "Raising base resource limits (open files, processes, stack)"
 ulimit -n 32768 || log "Warning: failed to increase open file limit"
 ulimit -u 65535 || log "Warning: failed to increase user process limit"
 ulimit -s unlimited || log "Warning: failed to set stack size (unlimited)"
+
+if [[ "$USE_REALTIME" == "true" && "$(id -u)" -eq 0 ]]; then
+    raise_realtime_limits
+elif [[ "$USE_REALTIME" == "true" ]]; then
+    log "REALTIME requested but not running as root → skipping kernel limit raises"
+fi
 
 if [[ "$SKIP_BUILD" == "false" ]]; then
     log "Cleaning build directory"

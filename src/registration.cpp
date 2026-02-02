@@ -85,6 +85,7 @@ int main(const int argc, char** argv)
     }
 
     g_shm = static_cast<ERShared*>(mmap(nullptr, sizeof(ERShared), PROT_READ | PROT_WRITE, MAP_SHARED, g_shm_fd, 0));
+
     if (g_shm == MAP_FAILED)
     {
         perror("mmap reg");
@@ -99,16 +100,16 @@ int main(const int argc, char** argv)
     }
 
     // Open message queues
-    const mqd_t mq_reg = mq_open(MQ_REG_NAME, O_RDONLY);
-    if (mq_reg == (mqd_t)-1)
+    const mqd_t mq_reg = mq_open(MQ_REG_NAME, O_RDONLY | O_CLOEXEC);
+    if (mq_reg == ( mqd_t ) - 1)
     {
         perror("mq_open reg read");
         cleanup();
         return 1;
     }
 
-    const mqd_t mq_triage = mq_open(MQ_TRIAGE_NAME, O_WRONLY);
-    if (mq_triage == (mqd_t)-1)
+    const mqd_t mq_triage = mq_open(MQ_TRIAGE_NAME, O_WRONLY | O_CLOEXEC);
+    if (mq_triage == ( mqd_t ) - 1)
     {
         perror("mq_open triage write");
         cleanup();
@@ -161,7 +162,6 @@ int main(const int argc, char** argv)
 
         PatientInfo p{};
         memcpy(&p, buf, sizeof(PatientInfo));
-        // Update shared memory counts
         if (sem_wait(g_shm_sem) == -1)
         {
             perror("sem_wait reg2");
@@ -172,20 +172,28 @@ int main(const int argc, char** argv)
             g_shm->current_inside++;
             if (p.pid > 0)
             {
-                char mqname[256];
-                snprintf(mqname, sizeof( mqname ), "%s%u", PATIENT_CTRL_MQ_PREFIX, static_cast<unsigned>(p.pid));
-                if (const mqd_t mq = mq_open(mqname, O_WRONLY | O_NONBLOCK); mq != (mqd_t)-1)
+                ControlMessage cm{};
+                cm.cmd        = CTRL_INSIDE;
+                cm.target_pid = p.pid;
+
+                const mqd_t mq_ctrl = mq_open(MQ_PATIENT_CTRL, O_WRONLY | O_CLOEXEC);
+
+                if (mq_ctrl != ( mqd_t ) - 1)
                 {
-                    ControlMessage cm{};
-                    cm.cmd = CTRL_INSIDE;
-                    // no extra fields necessary
-                    mq_send(mq, reinterpret_cast<const char*>(&cm), sizeof( cm ), 0);
-                    mq_close(mq);
-                    log_reg("Sent CTRL_INSIDE to pid=" + std::to_string(p.pid));
+                    if (mq_send(mq_ctrl, reinterpret_cast<const char*>(&cm), sizeof( cm ), 0) == -1)
+                    {
+                        log_reg("Failed to send CTRL_INSIDE to pid=" + std::to_string(p.pid) + " errno=" + std::to_string(errno));
+                    }
+                    else
+                    {
+                        log_reg("Sent CTRL_INSIDE to pid=" + std::to_string(p.pid));
+                    }
+
+                    mq_close(mq_ctrl);
                 }
                 else
                 {
-                    log_reg("Failed to send CTRL_INSIDE to pid=" + std::to_string(p.pid) + " errno=" + strerror(errno));
+                    log_reg("Failed to open MQ_PATIENT_CTRL errno=" + std::to_string(errno));
                 }
             }
         }
