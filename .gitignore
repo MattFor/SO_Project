@@ -1,4 +1,7 @@
 logs
 build
+tools/build
+cmake-build-debug
 
 .idea
+raport.md

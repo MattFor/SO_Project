@@ -73,9 +73,9 @@ done
 BUILD_DIR="build"
 BIN_DIR="${BUILD_DIR}/bin"
 
-WAITING_ROOM_SIZE=10000
-DOCTORS=100
-PATIENTS=1000000
+WAITING_ROOM_SIZE=1000
+DOCTORS=10
+PATIENTS=10000000
 
 raise_realtime_limits() {
     log "REALTIME: Raising hard resource limits (best-effort)"

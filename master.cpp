@@ -55,6 +55,19 @@ static ControlRegistry* g_ctrl_reg = nullptr;
 static int   g_total_shm_sz   = 0;
 static pid_t g_dispatcher_pid = -1;
 
+static constexpr auto COLOR_RESET   = "\x1b[0m";
+static constexpr auto COLOR_RED     = "\x1b[31m";
+static constexpr auto COLOR_GREEN   = "\x1b[32m";
+static constexpr auto COLOR_YELLOW  = "\x1b[33m";
+static constexpr auto COLOR_BLUE    = "\x1b[34m";
+static constexpr auto COLOR_MAGENTA = "\x1b[35m";
+static constexpr auto COLOR_CYAN    = "\x1b[36m";
+
+static const char* color_or_empty(const char* code)
+{
+    return isatty(STDOUT_FILENO) ? code : "";
+}
+
 static void log_master(const std::string& s)
 {
     if constexpr (!LOGGING)
@@ -860,7 +873,7 @@ static void signal_all_services(const pid_t reg1, const pid_t reg2, const pid_t 
             {
                 std::ostringstream oss;
                 oss << "Sent signal " << sig << " to pid=" << pid << " (" << name << ")";
-                std::cout << oss.str() << std::endl;
+                std::cout << color_or_empty(COLOR_YELLOW) << oss.str() << color_or_empty(COLOR_RESET) << std::endl;
             }
         }
     };
@@ -961,7 +974,11 @@ static void input_thread_fn(std::atomic_bool& stop_flag, pid_t& reg1_pid, pid_t&
 
             if (cmd == "help")
             {
+                const char* G = color_or_empty(COLOR_GREEN);
+                const char* R = color_or_empty(COLOR_RESET);
+                std::cout << G;
                 std::cout << "Supported commands:\n" << "  help                     - show this help\n" << "  signal <SIG...> [pid]    - send a POSIX signal (e.g. SIGUSR2)\n" << "  list                     - show simulation status and queue lengths\n" << "  add N                    - add N new patients now\n" << "  quit | shutdown | exit   - request shutdown\n";
+                std::cout << R;
                 log_master("input_thread: help requested");
             }
             else if (cmd == "doctor")
@@ -1456,6 +1473,9 @@ static void input_thread_fn(std::atomic_bool& stop_flag, pid_t& reg1_pid, pid_t&
             }
             else if (cmd == "list")
             {
+                const char* B = color_or_empty(COLOR_BLUE);
+                const char* R = color_or_empty(COLOR_RESET);
+
                 const double elapsed = seconds_since_start();
 
                 const long adults   = g_spawned_adults.load(std::memory_order_relaxed);
@@ -1485,6 +1505,8 @@ static void input_thread_fn(std::atomic_bool& stop_flag, pid_t& reg1_pid, pid_t&
                     std::lock_guard lk(g_patient_mutex);
                     adults_snapshot = adult_patient_pids.size();
                 }
+
+                std::cout << B;
 
                 std::cout << "--- simulation status ---\n";
                 std::cout << "registration #1 pid=" << reg1_pid << "\n";
@@ -1516,11 +1538,18 @@ static void input_thread_fn(std::atomic_bool& stop_flag, pid_t& reg1_pid, pid_t&
 
                 std::cout << "total spawned: " << total << " (avg " << total_rate << " /s)\n";
 
+                std::cout << R;
+
                 log_master("input_thread: list command executed");
             }
             else if (cmd == "quit" || cmd == "shutdown" || cmd == "exit")
             {
+                const char* B = color_or_empty(COLOR_RED);
+                const char* R = color_or_empty(COLOR_RESET);
+
+                std::cout << B;
                 std::cout << "Interactive requested shutdown\n";
+                std::cout << R;
 
                 if (bool expected = false; g_shutdown_requested.compare_exchange_strong(expected, true))
                 {
@@ -1567,7 +1596,12 @@ int main(int argc, char** argv)
 {
     if constexpr (!LOGGING)
     {
+        const char* G = color_or_empty(COLOR_RED);
+        const char* R = color_or_empty(COLOR_RESET);
+
+        std::cout << G;
         std::cout << "Logging is disabled" << '\n';
+        std::cout << R;
     }
 
     if (argc < 4)

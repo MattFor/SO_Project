@@ -135,7 +135,7 @@ static std::string ctrl_sem_name(const size_t bucket)
 
 static size_t slot_to_bucket(const size_t slot_idx)
 {
-    return slot_idx & CTRL_SEM_BUCKETS - 1;
+    return slot_idx & (CTRL_SEM_BUCKETS - 1);
 }
 
 
