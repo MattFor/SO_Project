@@ -537,8 +537,8 @@ static void control_thread_fn()
             break;
         }
 
-        ControlSlot&   slot = g_ctrl_reg->slots[static_cast<size_t>(g_ctrl_slot)];
-        if (const uint32_t seq  = slot.seq.load(std::memory_order_acquire); seq == 0)
+        ControlSlot& slot = g_ctrl_reg->slots[static_cast<size_t>(g_ctrl_slot)];
+        if (const uint32_t seq = slot.seq.load(std::memory_order_acquire); seq == 0)
         {
             continue;
         }
@@ -887,7 +887,6 @@ static bool setup_shm_local()
 
     return true;
 }
-
 
 static void cleanup_local()
 {
